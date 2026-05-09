@@ -7,9 +7,6 @@
     }
   ],
   "functions": {
-    "api/agent/**/*.ts": {
-      "maxDuration": 300
-    },
     "api/ingest/**/*.ts": {
       "maxDuration": 300
     }
