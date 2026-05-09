@@ -6,7 +6,6 @@
   "type": "module",
   "scripts": {
     "dev": "vercel dev",
-    "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "deploy:preview": "vercel",
     "deploy:prod": "vercel --prod"
