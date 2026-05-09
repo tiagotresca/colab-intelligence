@@ -36,14 +36,18 @@ export interface BusinessHealthOutput {
   empresa_name: string;
   generated_at: string;
   period: { start: string; end: string };
+  currency: string | null;
   headline: string; // 1 frase: "estado geral em 1 frase"
   kpis: {
     revenue_30d: number | null;
-    revenue_change_pct: number | null;
+    revenue_change_pct: number | null;       // Phase 2 — precisa 60d para comparar
+    orders_30d: number | null;
+    aov_30d: number | null;
     new_customers_30d: number | null;
-    cac_30d: number | null;
-    ltv_30d: number | null;
-    roas_30d: number | null;
+    repeat_purchase_rate_30d: number | null; // 0..1
+    cac_30d: number | null;                  // Phase 2 — precisa Meta Ads
+    ltv_30d: number | null;                  // Phase 2 — precisa cohort
+    roas_30d: number | null;                 // Phase 2 — precisa Meta Ads
   };
   signals: Array<{
     severity: 'info' | 'warning' | 'critical';
