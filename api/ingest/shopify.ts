@@ -254,11 +254,10 @@ async function processEmpresa(e: EmpresaWithShopify): Promise<EmpresaResult> {
       customersIngested += rows.length;
     }
 
-    // 5. Synthesize — lê raw, computa KPIs, upsert kpi_snapshots
-    const synth = await synthesizeShopify(e.empresa_id, {
-      start: rangeStart,
-      end: rangeEnd,
-    });
+    // 5. Synthesize — lê raw, computa KPIs, upsert kpi_snapshots.
+    // Janela própria (default 30d) independente do range incremental
+    // do ingest, para que cada run recompute todo o histórico relevante.
+    const synth = await synthesizeShopify(e.empresa_id);
 
     // 6. Close run success
     await supabase

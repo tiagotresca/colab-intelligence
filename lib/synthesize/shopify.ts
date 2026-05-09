@@ -4,19 +4,21 @@
 // produz KPIs derivados em kpi_snapshots. Função pura — não chama a
 // Shopify API, só faz queries à nossa DB.
 //
-// Phase 1: 5 KPIs base, granularidade diária. Adicionar KPI = adicionar
-// entrada no KPI_REGISTRY abaixo + função compute. Não toca no
-// orquestrador.
+// Janela fixa (default 30d) independente do range de ingest:
+// re-computa todo o histórico relevante em cada run. Idempotente
+// (unique constraint em kpi_snapshots), portanto re-correr é seguro
+// e barato. Phase 2+ podemos passar a janela maior para suportar
+// trend analysis ou tornar configurável por canal.
 //
-// Idempotente: kpi_snapshots tem unique constraint
-// (empresa_id, channel, metric_key, period_grain, period_start) →
-// upsert sobre re-run só actualiza valores.
+// Phase 1: 5 KPIs base, granularidade diária. Adicionar KPI = nova
+// entry no compute loop. Adicionar canal = lib/synthesize/<canal>.ts.
 
 import { supabase } from '../supabase.js';
 import type { Channel, PeriodGrain } from '../types.js';
 
 const CHANNEL: Channel = 'shopify';
 const GRAIN: PeriodGrain = 'day';
+const DEFAULT_LOOKBACK_DAYS = 30;
 
 // Status que contam para revenue. Refunded = 0, paid e
 // partially_refunded contam (com total_price líquido reportado).
@@ -44,12 +46,24 @@ interface KpiRow {
 export interface SynthesizeResult {
   days_computed: number;
   kpis_upserted: number;
+  range: { start: string; end: string };
+}
+
+export interface SynthesizeOptions {
+  lookback_days?: number;
 }
 
 export async function synthesizeShopify(
   empresa_id: string,
-  range: { start: string; end: string },
+  options: SynthesizeOptions = {},
 ): Promise<SynthesizeResult> {
+  const lookback = options.lookback_days ?? DEFAULT_LOOKBACK_DAYS;
+  const now = new Date();
+  const rangeEnd = now.toISOString();
+  const rangeStart = new Date(
+    now.getTime() - lookback * 24 * 3600 * 1000,
+  ).toISOString();
+
   // 1. Fetch orders dentro do range. Limit alto — para >50k orders
   // numa empresa grande, paginar (TODO Phase 1.5).
   const { data: ordersData, error: ordersErr } = await supabase
@@ -58,8 +72,8 @@ export async function synthesizeShopify(
       'shopify_order_id, created_at, total_price, financial_status, customer_id, currency',
     )
     .eq('empresa_id', empresa_id)
-    .gte('created_at', range.start)
-    .lt('created_at', range.end)
+    .gte('created_at', rangeStart)
+    .lt('created_at', rangeEnd)
     .limit(50000);
 
   if (ordersErr) {
@@ -68,7 +82,11 @@ export async function synthesizeShopify(
   const orders = (ordersData ?? []) as OrderRow[];
 
   if (orders.length === 0) {
-    return { days_computed: 0, kpis_upserted: 0 };
+    return {
+      days_computed: 0,
+      kpis_upserted: 0,
+      range: { start: rangeStart, end: rangeEnd },
+    };
   }
 
   // 2. Para cada customer, descobrir a data do PRIMEIRO order alguma
@@ -184,7 +202,11 @@ export async function synthesizeShopify(
   }
 
   if (kpiRows.length === 0) {
-    return { days_computed: byDay.size, kpis_upserted: 0 };
+    return {
+      days_computed: byDay.size,
+      kpis_upserted: 0,
+      range: { start: rangeStart, end: rangeEnd },
+    };
   }
 
   // 5. Upsert. Unique constraint trata da idempotência.
@@ -200,5 +222,6 @@ export async function synthesizeShopify(
   return {
     days_computed: byDay.size,
     kpis_upserted: kpiRows.length,
+    range: { start: rangeStart, end: rangeEnd },
   };
 }
