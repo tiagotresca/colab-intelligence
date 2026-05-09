@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/api/ingest/shopify",
+      "schedule": "0 5 * * *"
+    }
+  ],
+  "functions": {
+    "api/agent/**/*.ts": {
+      "maxDuration": 300
+    },
+    "api/ingest/**/*.ts": {
+      "maxDuration": 300
+    }
+  }
+}
