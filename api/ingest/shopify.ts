@@ -26,6 +26,7 @@ import {
   type EmpresaWithShopify,
 } from '../../lib/shopify.js';
 import { supabase } from '../../lib/supabase.js';
+import { synthesizeShopify } from '../../lib/synthesize/shopify.js';
 
 const LOOKBACK_DAYS_FIRST_RUN = 30;
 const REFETCH_RECENT_DAYS = 7;
@@ -63,6 +64,8 @@ interface EmpresaResult {
   status: 'success' | 'failed' | 'failed_pre_run';
   orders?: number;
   customers?: number;
+  kpis_upserted?: number;
+  days_computed?: number;
   range?: { start: string; end: string };
   error?: string;
 }
@@ -251,7 +254,13 @@ async function processEmpresa(e: EmpresaWithShopify): Promise<EmpresaResult> {
       customersIngested += rows.length;
     }
 
-    // 5. Close run success
+    // 5. Synthesize — lê raw, computa KPIs, upsert kpi_snapshots
+    const synth = await synthesizeShopify(e.empresa_id, {
+      start: rangeStart,
+      end: rangeEnd,
+    });
+
+    // 6. Close run success
     await supabase
       .from('etl_runs')
       .update({
@@ -267,6 +276,8 @@ async function processEmpresa(e: EmpresaWithShopify): Promise<EmpresaResult> {
       status: 'success',
       orders: ordersIngested,
       customers: customersIngested,
+      kpis_upserted: synth.kpis_upserted,
+      days_computed: synth.days_computed,
       range: { start: rangeStart, end: rangeEnd },
     };
   } catch (err) {
