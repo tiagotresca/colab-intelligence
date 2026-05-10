@@ -250,7 +250,7 @@ function buildHeadline(args: {
   currency: string | null;
 }): string {
   const { revenue_30d, orders_30d, aov_30d, repeat_purchase_rate_30d, meta_spend_30d, roas_30d, currency } = args;
-  const sym = currency === 'EUR' ? '€' : currency === 'USD' ? '$' : `${currency ?? ''} `;
+  const sym = currency === 'EUR' ? '€' : currency === 'USD' ? '$' : currency ? `${currency} ` : '';
   const fmtMoney = (v: number | null) =>
     v == null ? '?' : `${sym}${Math.round(v).toLocaleString('pt-PT')}`;
 

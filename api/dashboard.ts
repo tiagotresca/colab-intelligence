@@ -18,12 +18,15 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { supabase } from '../lib/supabase.js';
 import { listEmpresasWithShopify } from '../lib/shopify.js';
 import { ingestShopifyEmpresa } from '../lib/ingest/shopify.js';
+import { listEmpresasWithMetaAds } from '../lib/meta-ads.js';
+import { ingestMetaAdsEmpresa } from '../lib/ingest/meta-ads.js';
 
 interface EmpresaRow {
   id: string;
   name: string;
 }
 interface KpiRow {
+  channel: string;
   metric_key: string;
   period_start: string;
   value: number | null;
@@ -67,6 +70,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let runs: EtlRunRow[] = [];
   let ordersCount = 0;
   let customersCount = 0;
+  let metaCampaignsCount = 0;
+  let metaInsightsCount = 0;
   let healthJson: unknown = null;
 
   if (empresa) {
@@ -75,10 +80,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       Date.now() - 30 * 24 * 3600 * 1000,
     ).toISOString();
 
-    const [kpiQ, runsQ, ordersQ, customersQ] = await Promise.all([
+    const [kpiQ, runsQ, ordersQ, customersQ, metaCampQ, metaInsightsQ] = await Promise.all([
       supabase
         .from('kpi_snapshots')
-        .select('metric_key, period_start, value, meta')
+        .select('channel, metric_key, period_start, value, meta')
         .eq('empresa_id', empresa.id)
         .eq('period_grain', 'day')
         .gte('period_start', periodStart)
@@ -98,12 +103,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .from('shopify_customers_raw')
         .select('shopify_customer_id', { count: 'exact', head: true })
         .eq('empresa_id', empresa.id),
+      supabase
+        .from('meta_ads_campaigns_raw')
+        .select('campaign_id', { count: 'exact', head: true })
+        .eq('empresa_id', empresa.id),
+      supabase
+        .from('meta_ads_insights_raw')
+        .select('campaign_id', { count: 'exact', head: true })
+        .eq('empresa_id', empresa.id),
     ]);
 
     kpis = (kpiQ.data ?? []) as KpiRow[];
     runs = (runsQ.data ?? []) as EtlRunRow[];
     ordersCount = ordersQ.count ?? 0;
     customersCount = customersQ.count ?? 0;
+    metaCampaignsCount = metaCampQ.count ?? 0;
+    metaInsightsCount = metaInsightsQ.count ?? 0;
 
     // Inline call ao MCP get_business_health (mesmo lookup que faz por
     // dentro). Mais simples re-chamar via fetch interno do que duplicar
@@ -118,6 +133,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     runs,
     ordersCount,
     customersCount,
+    metaCampaignsCount,
+    metaInsightsCount,
     healthJson,
     justTriggered,
   });
@@ -129,18 +146,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
 async function handleTrigger(req: VercelRequest, res: VercelResponse) {
   try {
-    const empresas = await listEmpresasWithShopify();
-    const results = [];
-    for (const e of empresas) {
-      results.push(await ingestShopifyEmpresa(e));
+    let totalResults = 0;
+
+    // Shopify
+    const shopifyEmpresas = await listEmpresasWithShopify();
+    for (const e of shopifyEmpresas) {
+      await ingestShopifyEmpresa(e);
+      totalResults++;
     }
+
+    // Meta Ads
+    const metaEmpresas = await listEmpresasWithMetaAds();
+    for (const e of metaEmpresas) {
+      await ingestMetaAdsEmpresa(e);
+      totalResults++;
+    }
+
     // Redirect back to GET para refrescar a UI
     const empresa = (req.query.empresa as string | undefined) ?? '';
     const back = empresa
       ? `/dashboard?empresa=${empresa}&triggered=1`
       : `/dashboard?triggered=1`;
     res.setHeader('Location', back);
-    res.status(303).send(`Triggered ${results.length} empresas. Redirecting...`);
+    res.status(303).send(`Triggered ${totalResults} ingests. Redirecting...`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'erro desconhecido';
     res.status(500).send(`Trigger failed: ${msg}`);
@@ -198,33 +226,54 @@ interface RenderArgs {
   runs: EtlRunRow[];
   ordersCount: number;
   customersCount: number;
+  metaCampaignsCount: number;
+  metaInsightsCount: number;
   healthJson: unknown;
   justTriggered: boolean;
 }
 
 function renderDashboard(args: RenderArgs): string {
-  const { empresas, selected, kpis, runs, ordersCount, customersCount, healthJson, justTriggered } = args;
+  const { empresas, selected, kpis, runs, ordersCount, customersCount, metaCampaignsCount, metaInsightsCount, healthJson, justTriggered } = args;
 
-  const dailyRevenue = kpis.filter((k) => k.metric_key === 'revenue_day');
+  const dailyRevenue = kpis.filter((k) => k.channel === 'shopify' && k.metric_key === 'revenue_day');
+  const dailyMetaSpend = kpis.filter((k) => k.channel === 'meta_ads' && k.metric_key === 'spend_day');
   const currency =
-    (kpis.find((k) => k.meta?.currency)?.meta?.currency as string | undefined) ?? '';
+    (kpis.find((k) => k.channel === 'shopify' && k.meta?.currency)?.meta?.currency as string | undefined) ?? '';
 
-  const sumOf = (key: string): number | null => {
-    const rows = kpis.filter((k) => k.metric_key === key);
+  const sumOf = (channel: string, key: string): number | null => {
+    const rows = kpis.filter((k) => k.channel === channel && k.metric_key === key);
     if (rows.length === 0) return null;
     return rows.reduce((s, r) => s + (Number(r.value) || 0), 0);
   };
-  const avgOf = (key: string): number | null => {
-    const rows = kpis.filter((k) => k.metric_key === key);
+  const avgOf = (channel: string, key: string): number | null => {
+    const rows = kpis.filter((k) => k.channel === channel && k.metric_key === key);
     if (rows.length === 0) return null;
     return rows.reduce((s, r) => s + (Number(r.value) || 0), 0) / rows.length;
   };
 
-  const revenue30d = sumOf('revenue_day');
-  const orders30d = sumOf('orders_count_day');
-  const newCust30d = sumOf('new_customers_day');
-  const repeat30d = avgOf('repeat_purchase_rate_day');
+  // Shopify
+  const revenue30d = sumOf('shopify', 'revenue_day');
+  const orders30d = sumOf('shopify', 'orders_count_day');
+  const newCust30d = sumOf('shopify', 'new_customers_day');
+  const repeat30d = avgOf('shopify', 'repeat_purchase_rate_day');
   const aov30d = revenue30d != null && orders30d ? revenue30d / orders30d : null;
+
+  // Meta Ads
+  const metaSpend30d = sumOf('meta_ads', 'spend_day');
+  const metaImpressions30d = sumOf('meta_ads', 'impressions_day');
+  const metaClicks30d = sumOf('meta_ads', 'clicks_day');
+  const metaPurchases30d = sumOf('meta_ads', 'purchases_day');
+  const metaCtr30d = metaClicks30d != null && metaImpressions30d && metaImpressions30d > 0
+    ? metaClicks30d / metaImpressions30d : null;
+  const metaCpc30d = metaSpend30d != null && metaClicks30d && metaClicks30d > 0
+    ? metaSpend30d / metaClicks30d : null;
+
+  // Cross-channel (só preenche quando ambos estão presentes)
+  const cac30d = metaSpend30d != null && newCust30d && newCust30d > 0 ? metaSpend30d / newCust30d : null;
+  const roas30d = revenue30d != null && metaSpend30d && metaSpend30d > 0 ? revenue30d / metaSpend30d : null;
+
+  const hasShopify = revenue30d != null || orders30d != null;
+  const hasMeta = metaSpend30d != null;
 
   const sym = currency === 'EUR' ? '€' : currency === 'USD' ? '$' : currency ? `${currency} ` : '';
   const fmtMoney = (v: number | null) =>
@@ -260,10 +309,6 @@ function renderDashboard(args: RenderArgs): string {
           </tr>`;
         })
         .join('');
-
-  const sparkline = renderSparkline(
-    dailyRevenue.map((k) => ({ x: new Date(k.period_start), y: Number(k.value) || 0 })),
-  );
 
   const healthPretty = JSON.stringify(healthJson, null, 2);
 
@@ -334,7 +379,8 @@ ${selected ? '' : '<p class="muted">Sem empresas ingeridas ainda. Carrega em "Tr
 </form>
 
 ${selected ? `
-<h2>KPIs últimos 30 dias</h2>
+${hasShopify ? `
+<h2>Shopify — últimos 30 dias</h2>
 <div class="cards">
   <div class="card"><div class="label">Revenue</div><div class="value">${fmtMoney(revenue30d)}</div></div>
   <div class="card"><div class="label">Orders</div><div class="value">${fmtInt(orders30d)}</div></div>
@@ -345,13 +391,41 @@ ${selected ? `
 
 <div class="sparkline-wrap">
   <div class="label">Revenue diário (${dailyRevenue.length} dias)</div>
-  ${sparkline}
+  ${renderSparkline(dailyRevenue.map((k) => ({ x: new Date(k.period_start), y: Number(k.value) || 0 })), '#56d364')}
 </div>
+` : '<p class="muted">Shopify não ligado para esta empresa.</p>'}
+
+${hasMeta ? `
+<h2>Meta Ads — últimos 30 dias</h2>
+<div class="cards">
+  <div class="card"><div class="label">Spend</div><div class="value">${fmtMoney(metaSpend30d)}</div></div>
+  <div class="card"><div class="label">Impressions</div><div class="value">${fmtInt(metaImpressions30d)}</div></div>
+  <div class="card"><div class="label">Clicks</div><div class="value">${fmtInt(metaClicks30d)}</div></div>
+  <div class="card"><div class="label">CTR</div><div class="value">${fmtPct(metaCtr30d)}</div></div>
+  <div class="card"><div class="label">CPC</div><div class="value">${fmtMoney(metaCpc30d)}</div></div>
+  <div class="card"><div class="label">Purchases (Meta-attrib)</div><div class="value">${fmtInt(metaPurchases30d)}</div></div>
+</div>
+
+<div class="sparkline-wrap">
+  <div class="label">Spend diário Meta (${dailyMetaSpend.length} dias)</div>
+  ${renderSparkline(dailyMetaSpend.map((k) => ({ x: new Date(k.period_start), y: Number(k.value) || 0 })), '#1f6feb')}
+</div>
+` : '<p class="muted">Meta Ads não ligado para esta empresa.</p>'}
+
+${hasShopify && hasMeta ? `
+<h2>Cross-channel</h2>
+<div class="cards">
+  <div class="card"><div class="label">CAC (cost per new customer)</div><div class="value">${fmtMoney(cac30d)}</div></div>
+  <div class="card"><div class="label">ROAS (revenue ÷ Meta spend)</div><div class="value">${roas30d != null ? roas30d.toFixed(2) + 'x' : '—'}</div></div>
+</div>
+` : ''}
 
 <h2>Raw em DB</h2>
 <div class="raw-counts">
-  <div class="item"><div class="label">Orders ingeridos</div><div class="value">${fmtInt(ordersCount)}</div></div>
-  <div class="item"><div class="label">Customers ingeridos</div><div class="value">${fmtInt(customersCount)}</div></div>
+  <div class="item"><div class="label">Shopify orders</div><div class="value">${fmtInt(ordersCount)}</div></div>
+  <div class="item"><div class="label">Shopify customers</div><div class="value">${fmtInt(customersCount)}</div></div>
+  <div class="item"><div class="label">Meta campaigns</div><div class="value">${fmtInt(metaCampaignsCount)}</div></div>
+  <div class="item"><div class="label">Meta insights (rows)</div><div class="value">${fmtInt(metaInsightsCount)}</div></div>
 </div>
 
 <h2>Últimos ETL runs</h2>
@@ -372,7 +446,10 @@ ${selected ? `
 </body></html>`;
 }
 
-function renderSparkline(points: Array<{ x: Date; y: number }>): string {
+function renderSparkline(
+  points: Array<{ x: Date; y: number }>,
+  color: string = '#56d364',
+): string {
   if (points.length === 0) {
     return '<div class="muted" style="padding: 24px; text-align: center;">Sem dados</div>';
   }
@@ -387,9 +464,11 @@ function renderSparkline(points: Array<{ x: Date; y: number }>): string {
     .map((p, i) => `${i === 0 ? 'M' : 'L'} ${pad + i * xStep} ${yScale(p.y)}`)
     .join(' ');
   const fillPath = `${path} L ${pad + (points.length - 1) * xStep} ${h - pad} L ${pad} ${h - pad} Z`;
+  // Hex color → low-alpha fill version (append "22")
+  const fillColor = `${color}22`;
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width: 100%; height: 80px; display: block;">
-    <path d="${fillPath}" fill="#56d36422" stroke="none" />
-    <path d="${path}" fill="none" stroke="#56d364" stroke-width="2" />
+    <path d="${fillPath}" fill="${fillColor}" stroke="none" />
+    <path d="${path}" fill="none" stroke="${color}" stroke-width="2" />
   </svg>`;
 }
 
