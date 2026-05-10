@@ -122,6 +122,17 @@ async function getBusinessHealth(
       ? meta_spend_30d / meta_clicks_30d
       : null;
 
+  // ---- GA4 aggregations (sessions, users, conversions, revenue, top channels)
+  const ga4_sessions_30d = sumOf('ga4', 'sessions_day');
+  const ga4_users_30d = sumOf('ga4', 'users_day');
+  const ga4_engagement_rate_30d = weightedRatioOf('ga4', 'engaged_sessions_day');
+  const ga4_conversions_30d = sumOf('ga4', 'conversions_day');
+  const ga4_revenue_30d = sumOf('ga4', 'revenue_day');
+  // Channel breakdown — keys produzidos por synthesize/ga4.ts (snake_case do
+  // sessionDefaultChannelGroup do GA4: "Organic Search" → "organic_search").
+  const ga4_organic_sessions_30d = sumOf('ga4', 'sessions_organic_search_day');
+  const ga4_paid_social_sessions_30d = sumOf('ga4', 'sessions_paid_social_day');
+
   // ---- Cross-channel (só preenche quando ambos os canais têm dados)
   const cac_30d =
     meta_spend_30d != null && new_customers_30d && new_customers_30d > 0
@@ -209,6 +220,52 @@ async function getBusinessHealth(
       suggested_action: 'Foco em LTV: email/WhatsApp flows pós-compra, programa fidelidade.',
     });
   }
+  // GA4 — attribution gap entre Meta clicks e GA4 paid social sessions.
+  // Se GA4 vê <50% dos cliques que Meta reporta, há tracking partido
+  // (UTMs, cookie consent, redirects) ou attribution misturada.
+  if (
+    meta_clicks_30d != null &&
+    meta_clicks_30d >= 100 &&
+    ga4_paid_social_sessions_30d != null
+  ) {
+    const ratio = ga4_paid_social_sessions_30d / meta_clicks_30d;
+    if (ratio < 0.5) {
+      signals.push({
+        severity: 'warning',
+        message: `Gap de tracking: GA4 só registou ${ga4_paid_social_sessions_30d} sessões Paid Social vs ${meta_clicks_30d} clicks Meta (${Math.round(ratio * 100)}%).`,
+        suggested_action: 'Verificar UTMs nos ads (utm_source=facebook/instagram, utm_medium=paid_social) e consent do GA4.',
+      });
+    }
+  }
+  // GA4 vs Shopify revenue — divergência grande indica data quality issue
+  if (
+    ga4_revenue_30d != null &&
+    revenue_30d != null &&
+    revenue_30d >= 1000 &&
+    ga4_revenue_30d > 0
+  ) {
+    const diff = Math.abs(ga4_revenue_30d - revenue_30d) / revenue_30d;
+    if (diff > 0.25) {
+      signals.push({
+        severity: 'info',
+        message: `GA4 revenue (${Math.round(ga4_revenue_30d)}) diverge ${Math.round(diff * 100)}% de Shopify (${Math.round(revenue_30d)}) — comum mas vale verificar tracking de purchase events.`,
+        suggested_action: 'Source-of-truth é Shopify; usar GA4 só para attribution last-touch.',
+      });
+    }
+  }
+  // Engagement rate baixo → UX/landing page pode estar a perder utilizadores
+  if (
+    ga4_engagement_rate_30d != null &&
+    ga4_sessions_30d != null &&
+    ga4_sessions_30d >= 500 &&
+    ga4_engagement_rate_30d < 0.4
+  ) {
+    signals.push({
+      severity: 'warning',
+      message: `Engagement rate baixo (${Math.round(ga4_engagement_rate_30d * 100)}%) em ${ga4_sessions_30d} sessões — landing pages a perder visitantes cedo.`,
+      suggested_action: 'Auditar páginas de entrada principais (above-the-fold, page speed, mensagem).',
+    });
+  }
 
   // 4. Staleness — último etl_run com sucesso por canal
   const { data: lastRuns } = await supabase
@@ -245,6 +302,13 @@ async function getBusinessHealth(
       meta_ctr_30d,
       meta_cpc_30d,
       meta_purchases_30d,
+      ga4_sessions_30d,
+      ga4_users_30d,
+      ga4_engagement_rate_30d,
+      ga4_conversions_30d,
+      ga4_revenue_30d,
+      ga4_organic_sessions_30d,
+      ga4_paid_social_sessions_30d,
       cac_30d,
       roas_30d,
       ltv_30d: null,                   // ainda null — cohort separado

@@ -52,6 +52,14 @@ export interface BusinessHealthOutput {
     meta_ctr_30d: number | null;             // 0..1 (clicks÷impressions)
     meta_cpc_30d: number | null;             // currency
     meta_purchases_30d: number | null;       // Meta-attributed purchases
+    // GA4 — traffic + last-touch attribution
+    ga4_sessions_30d: number | null;
+    ga4_users_30d: number | null;
+    ga4_engagement_rate_30d: number | null;  // 0..1 (engaged÷sessions, weighted)
+    ga4_conversions_30d: number | null;
+    ga4_revenue_30d: number | null;          // GA4-attributed revenue (compare com Shopify)
+    ga4_organic_sessions_30d: number | null; // sessions de Organic Search
+    ga4_paid_social_sessions_30d: number | null; // sessions de Paid Social
     // Cross-channel — só preenchidos quando Shopify + Meta presentes
     cac_30d: number | null;                  // meta_spend ÷ shopify_new_customers
     roas_30d: number | null;                 // shopify_revenue ÷ meta_spend (verdadeiro)
