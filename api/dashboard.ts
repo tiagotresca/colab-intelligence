@@ -21,6 +21,7 @@ import { ingestShopifyEmpresa } from '../lib/ingest/shopify.js';
 import { listEmpresasWithMetaAds } from '../lib/meta-ads.js';
 import { ingestMetaAdsEmpresa } from '../lib/ingest/meta-ads.js';
 import { importOrders } from '../lib/import/orders-importer.js';
+import { importSubscriptions } from '../lib/import/subscriptions-importer.js';
 import {
   synthesizeCustomersShopify,
   synthesizeCustomersFromManual,
@@ -82,6 +83,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'POST') {
     const action = (req.query.action as string | undefined) ?? 'trigger-ingest';
     if (action === 'import-orders') return handleImport(req, res);
+    if (action === 'import-subscriptions') return handleImportSubscriptions(req, res);
     return handleTrigger(req, res);
   }
 
@@ -352,6 +354,43 @@ async function handleImport(req: VercelRequest, res: VercelResponse) {
   }
 }
 
+// ---- Subscriptions+Subjects import handler ---------------------------------
+
+interface ImportSubsRequestBody {
+  empresa_id?: string;
+  source_platform?: string;
+  filename?: string;
+  csv_content?: string;
+}
+
+async function handleImportSubscriptions(req: VercelRequest, res: VercelResponse) {
+  const body = (req.body ?? {}) as ImportSubsRequestBody;
+  const empresa_id = body.empresa_id?.trim();
+  const source_platform = body.source_platform?.trim();
+  const csv_content = body.csv_content;
+
+  if (!empresa_id || !source_platform || !csv_content) {
+    res.status(400).json({
+      ok: false,
+      error: 'missing fields: empresa_id, source_platform, csv_content',
+    });
+    return;
+  }
+
+  try {
+    const result = await importSubscriptions({
+      empresa_id,
+      source_platform,
+      filename: body.filename ?? null,
+      csv_content,
+    });
+    res.status(200).json({ ok: true, import: result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'erro desconhecido';
+    res.status(500).json({ ok: false, error: msg });
+  }
+}
+
 // ---- Business health (replica simplificada do MCP tool) ---------------------
 
 async function computeBusinessHealth(empresa: EmpresaRow) {
@@ -599,10 +638,12 @@ ${selected ? `
 <div class="import-wrap" id="import-wrap">
   <div class="import-controls">
     <label class="import-label">Manual import:</label>
-    <button class="btn-secondary" type="button" onclick="document.getElementById('csv-input-shopify').click()">⬆ Shopify export (CSV)</button>
-    <button class="btn-secondary" type="button" onclick="promptCustomImport()">⬆ Custom site CSV</button>
+    <button class="btn-secondary" type="button" onclick="document.getElementById('csv-input-shopify').click()">⬆ Shopify orders</button>
+    <button class="btn-secondary" type="button" onclick="promptCustomImport()">⬆ Custom site orders</button>
+    <button class="btn-secondary" type="button" onclick="promptSubscriptionsImport()">⬆ Subscriptions+subjects</button>
     <input type="file" id="csv-input-shopify" accept=".csv,text/csv" hidden>
     <input type="file" id="csv-input-custom" accept=".csv,text/csv" hidden>
+    <input type="file" id="csv-input-subs" accept=".csv,text/csv" hidden>
     <span id="import-status" class="import-status"></span>
   </div>
 </div>
@@ -672,6 +713,54 @@ ${selected ? `
     if (!sp) return;
     window._customSourcePlatform = sp.trim();
     document.getElementById('csv-input-custom').click();
+  };
+
+  // Subscriptions+subjects upload (formato combinado)
+  async function uploadSubscriptionsCsv(file, sourcePlatform) {
+    if (!file) return;
+    setStatus('A ler ' + file.name + ' (' + (file.size / 1024).toFixed(0) + ' KB)…', 'pending');
+    try {
+      const csv = await file.text();
+      setStatus('A enviar e processar subscriptions+subjects…', 'pending');
+      const r = await fetch('/api/dashboard?action=import-subscriptions&empresa=' + encodeURIComponent(empresaId), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          empresa_id: empresaId,
+          source_platform: sourcePlatform,
+          filename: file.name,
+          csv_content: csv,
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) {
+        const err = (j && j.error) || ('HTTP ' + r.status);
+        setStatus('✗ Falhou: ' + err, 'error');
+        return;
+      }
+      const imp = j.import;
+      setStatus('✓ ' + imp.subjects_imported + ' subjects + ' + imp.subscriptions_imported + ' subscriptions importados (' + imp.rows_skipped + ' skipped). A refrescar…', 'success');
+      setTimeout(function() {
+        location.href = '/dashboard?empresa=' + encodeURIComponent(empresaId) + '&imported=1';
+      }, 1500);
+    } catch (err) {
+      setStatus('✗ Falhou: ' + (err.message || err), 'error');
+    }
+  }
+
+  document.getElementById('csv-input-subs').addEventListener('change', function(e) {
+    if (!e.target.files[0]) return;
+    const sp = window._subsSourcePlatform;
+    if (!sp) return;
+    uploadSubscriptionsCsv(e.target.files[0], sp);
+    e.target.value = '';
+  });
+
+  window.promptSubscriptionsImport = function() {
+    const sp = prompt('Source platform (ex: aquinta_custom, lukydog_custom):', 'aquinta_custom');
+    if (!sp) return;
+    window._subsSourcePlatform = sp.trim();
+    document.getElementById('csv-input-subs').click();
   };
 })();
 </script>

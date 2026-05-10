@@ -115,3 +115,112 @@ Customers são depois consumidos por:
 - Customer Quality Engine (PR B — em construção)
 - Dashboard do colab-intelligence
 - Botão Diagnóstico no work.colab
+
+---
+
+# Formato `subscriptions_v1` — Subscriptions + Subjects combinados
+
+Para empresas com **modelo de subscrição** (Quinta, Luky Dog, etc) onde
+cada subscrição é para **um sujeito** (cão, criança, planta, etc).
+
+Cada row do CSV representa **UMA subscription** + os dados do subject que
+ela serve. Repete-se o subject quando há múltiplas subscriptions para o
+mesmo subject (raro). Subjects únicos são deduplicated por `external_subject_id`.
+
+## Como usar
+
+Dashboard → seleccionar empresa → Manual import → **⬆ Subscriptions+subjects** →
+escolhe `source_platform` (ex: `aquinta_custom`) → upload do CSV.
+
+## Schema das colunas
+
+### Subscription (obrigatório se quiseres importar subscriptions)
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `external_subscription_id` | string | ID único da subscription na fonte |
+| `customer_email` | string | Email do dono da subscription (vai para email_hash) |
+| `started_at` | ISO date | Quando a subscription começou |
+| `status` | string | `active` / `paused` / `cancelled` (default: `active`) |
+| `product_sku` | string | SKU do produto/plano |
+| `frequency_days` | int | Frequência em dias (30 = mensal, 7 = semanal) |
+| `mrr` | number | Monthly recurring revenue (calculado se quiseres) |
+| `cancelled_at` | ISO date | Quando foi cancelada (se status=cancelled) |
+| `cancelled_reason` | string | `too_expensive` / `pet_died` / `other` / etc |
+| `subscription_metadata_json` | JSON | Campos extra estruturados |
+
+### Subject (opcional — se a subscription tem um sujeito associado)
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `external_subject_id` | string | ID único do subject na fonte (ex: 'dog_001') |
+| `subject_type` | string | `dog` / `cat` / `child` / `plant` / etc |
+| `subject_name` | string | Nome (ex: 'Bobby') |
+| `subject_active` | bool | true/false (default: true) |
+| `subject_<atributo>` | qualquer | Atributos típicos: `subject_breed`, `subject_age_years`, `subject_size`, `subject_weight_kg` — extraídos para `attributes` jsonb |
+| `subject_attributes_json` | JSON | Alternativa: tudo num só JSON em vez de colunas individuais |
+
+### Exemplo (Quinta — cães)
+
+```csv
+external_subscription_id,customer_email,started_at,status,product_sku,frequency_days,mrr,cancelled_at,cancelled_reason,external_subject_id,subject_type,subject_name,subject_breed,subject_age_years,subject_size,subject_weight_kg
+sub_001,joao@example.com,2024-08-15,active,FOOD-MEDIUM,30,29.90,,,dog_001,dog,Bobby,poodle,3,medium,15
+sub_002,maria@example.com,2024-05-10,cancelled,FOOD-SMALL,30,24.90,2025-12-15,too_expensive,dog_002,dog,Luna,bichon,5,small,8
+sub_003,maria@example.com,2025-01-20,active,FOOD-MEDIUM,30,29.90,,,dog_003,dog,Rex,labrador,2,medium,28
+```
+
+Maria tem 2 cães (Luna e Rex), 2 subscriptions (uma cancelada, uma activa).
+Cada cão é uma row em `subjects`. Cada subscription é uma row em `subscriptions`.
+Customer Maria é uma row em `customers` (já existente do orders import).
+
+### Exemplo alternativo com attributes_json
+
+Se preferires JSON livre em vez de colunas individuais:
+
+```csv
+external_subscription_id,customer_email,started_at,status,product_sku,frequency_days,mrr,external_subject_id,subject_type,subject_name,subject_attributes_json
+sub_001,joao@example.com,2024-08-15,active,FOOD-MEDIUM,30,29.90,dog_001,dog,Bobby,"{""breed"":""poodle"",""age_years"":3,""size"":""medium"",""weight_kg"":15,""dietary_restrictions"":""grain-free""}"
+```
+
+Útil quando o subject tem atributos não-standard (ex: `dietary_restrictions`).
+
+## Onde os dados acabam
+
+```
+manual import (1 CSV)
+       ↓
+   subjects table        ←──── subject info
+   subscriptions table   ←──── subscription info, com FK para subjects.id
+       ↓
+synthesizeSubscriptionMetrics (PR D.4 — em construção)
+       ↓
+KPIs: MRR, churn rate, retention by breed, LTV by subscription cohort
+```
+
+## Idempotência
+
+- **Subjects** dedup por `(empresa_id, external_subject_id)` → upsert.
+- **Subscriptions** dedup por `(empresa_id, external_subscription_id)` → upsert.
+- Re-importar o mesmo CSV é seguro. Atualiza rows existentes.
+- Se mudaste `cancelled_reason` no source e re-importas, o valor actualiza.
+
+## Como ligar orders a subscriptions
+
+Para análises tipo "campaign X traz subscriptions com churn baixo":
+- Cada order do customer + subscription deve ter ligação em
+  `order_subscription_links` table.
+- Atualmente: extracção desta link **é feita pela synthesize layer**
+  (PR D.4) — não é importada via CSV separado.
+
+Se a tua `manual_orders_raw` tiver coluna `external_subscription_id` no
+extra jsonb, o synth liga automaticamente. Para já, podes adicionar
+essa coluna ao orders.csv:
+
+```csv
+external_order_id,created_at,email,total_price,...,external_subscription_id,delivery_number
+order_001,2024-08-15,joao@example.com,29.90,...,sub_001,1
+order_002,2024-09-15,joao@example.com,29.90,...,sub_001,2
+```
+
+(O importer de orders mete `external_subscription_id` em `extra` jsonb.
+PR D.4 vai extrair daí.)
