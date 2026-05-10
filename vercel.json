@@ -11,6 +11,12 @@
   "functions": {
     "api/ingest/**/*.ts": {
       "maxDuration": 300
+    },
+    "api/dashboard.ts": {
+      "maxDuration": 300
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/dashboard", "destination": "/api/dashboard" }
+  ]
 }
