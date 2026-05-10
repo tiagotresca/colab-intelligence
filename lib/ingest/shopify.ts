@@ -8,6 +8,7 @@ import {
 } from '../shopify.js';
 import { supabase } from '../supabase.js';
 import { synthesizeShopify } from '../synthesize/shopify.js';
+import { deriveAttributionShopify } from '../synthesize/attribution-shopify.js';
 
 const LOOKBACK_DAYS_FIRST_RUN = 30;
 const REFETCH_RECENT_DAYS = 7;
@@ -47,6 +48,7 @@ export interface EmpresaResult {
   customers?: number;
   kpis_upserted?: number;
   days_computed?: number;
+  attribution_derived?: number;
   range?: { start: string; end: string };
   error?: string;
 }
@@ -202,7 +204,12 @@ export async function ingestShopifyEmpresa(
       customersIngested += rows.length;
     }
 
-    // 5. Synthesize — lê raw, computa KPIs, upsert kpi_snapshots
+    // 5a. Derive attribution — extrai UTMs / referring / source_name /
+    // discount_codes do payload jsonb dos orders, popula
+    // shopify_order_attribution. Idempotente.
+    const attr = await deriveAttributionShopify(e.empresa_id);
+
+    // 5b. Synthesize — lê raw, computa KPIs, upsert kpi_snapshots
     const synth = await synthesizeShopify(e.empresa_id);
 
     // 6. Close run success
@@ -223,6 +230,7 @@ export async function ingestShopifyEmpresa(
       customers: customersIngested,
       kpis_upserted: synth.kpis_upserted,
       days_computed: synth.days_computed,
+      attribution_derived: attr.rows_derived,
       range: { start: rangeStart, end: rangeEnd },
     };
   } catch (err) {
