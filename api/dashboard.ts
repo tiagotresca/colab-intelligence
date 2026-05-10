@@ -34,6 +34,7 @@ import {
   type AuditCheck,
   type Severity,
 } from '../lib/audit/checks.js';
+import { renderShell } from '../lib/ui/shell.js';
 
 interface EmpresaRow {
   id: string;
@@ -677,83 +678,9 @@ function renderDashboard(args: RenderArgs): string {
 
   const healthPretty = JSON.stringify(healthJson, null, 2);
 
-  return `<!DOCTYPE html>
-<html lang="pt">
-<head>
-<meta charset="utf-8">
-<title>colab-intelligence — dashboard</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  * { box-sizing: border-box; }
-  body {
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #0d1117; color: #e6edf3;
-    margin: 0; padding: 24px;
-  }
-  h1, h2 { font-weight: 600; margin: 0 0 16px; }
-  h1 { font-size: 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-  h1 .meta { color: #7d8590; font-size: 12px; font-weight: 400; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: #7d8590; margin-top: 32px; }
-  select, button, input {
-    background: #21262d; color: #e6edf3; border: 1px solid #30363d;
-    padding: 6px 12px; font: inherit; border-radius: 6px;
-  }
-  button { cursor: pointer; }
-  button.primary { background: #238636; border-color: #2ea043; color: white; }
-  button.primary:hover { background: #2ea043; }
-  .controls { display: flex; gap: 12px; align-items: center; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
-  .card { background: #161b22; border: 1px solid #30363d; padding: 16px; border-radius: 8px; }
-  .card .label { color: #7d8590; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-  .card .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .sparkline-wrap { background: #161b22; border: 1px solid #30363d; padding: 16px; border-radius: 8px; margin-bottom: 24px; }
-  .sparkline-wrap .label { color: #7d8590; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
-  th { color: #7d8590; font-weight: 500; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
-  td.err-msg { color: #f85149; font-size: 12px; }
-  .status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; text-transform: uppercase; font-weight: 600; }
-  .status.ok { background: #033a16; color: #56d364; }
-  .status.warn { background: #4d2d00; color: #e3b341; }
-  .status.err { background: #4c1014; color: #f85149; }
-  .muted { color: #7d8590; }
-  .raw-counts { display: flex; gap: 24px; padding: 16px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
-  .raw-counts .item { display: flex; flex-direction: column; gap: 4px; }
-  .raw-counts .label { color: #7d8590; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .raw-counts .value { font-size: 18px; font-variant-numeric: tabular-nums; font-weight: 600; }
-  details { background: #161b22; border: 1px solid #30363d; padding: 16px; border-radius: 8px; }
-  summary { cursor: pointer; color: #7d8590; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  pre { background: #0d1117; padding: 16px; border-radius: 6px; overflow: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 12px 0 0; }
-  .toast { background: #033a16; border: 1px solid #2ea043; color: #56d364; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; }
-  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #21262d; }
-  .tab { padding: 8px 14px; color: #7d8590; text-decoration: none; font-size: 13px; border-bottom: 2px solid transparent; }
-  .tab:hover { color: #e6edf3; }
-  .tab-active { color: #e6edf3; border-bottom-color: #56d364; }
-  .import-wrap { background: #161b22; border: 1px solid #30363d; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; }
-  .import-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .import-label { color: #7d8590; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
-  .btn-secondary { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 6px 12px; font: inherit; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  .btn-secondary:hover { background: #30363d; }
-  .import-status { font-size: 12px; color: #7d8590; margin-left: auto; }
-  .import-status.pending { color: #e3b341; }
-  .import-status.success { color: #56d364; }
-  .import-status.error { color: #f85149; }
-  .card-sub { color: #7d8590; font-size: 11px; margin-top: 4px; }
-  .sub-h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #7d8590; margin: 16px 0 8px; font-weight: 600; }
-</style>
-</head>
-<body>
-<h1>
-  colab-intelligence
-  <span class="meta">${new Date().toLocaleString('pt-PT')}</span>
-</h1>
-
-${selected ? `
-<nav class="tabs">
-  <a href="/dashboard?empresa=${selected.id}" class="tab tab-active">Overview</a>
-  <a href="/dashboard?view=audit&empresa=${selected.id}" class="tab">Audit</a>
-</nav>
-` : ''}
+  const content = `
+<h1 class="page-h">Overview</h1>
+<p class="page-sub">${selected ? escapeHtml(selected.name) : 'Sem empresa selecionada'}</p>
 
 ${justTriggered ? '<div class="toast">✓ Ingest disparado. Resultados refrescados em baixo.</div>' : ''}
 ${justImported ? '<div class="toast">✓ Import concluído. Customers re-sintetizados.</div>' : ''}
@@ -1029,8 +956,14 @@ ${recentImports.map((r) => {
   <pre>${escapeHtml(healthPretty)}</pre>
 </details>
 ` : ''}
+`;
 
-</body></html>`;
+  return renderShell({
+    title: 'Overview',
+    empresaId: selected ? selected.id : null,
+    activePath: 'overview',
+    content,
+  });
 }
 
 function renderSparkline(
@@ -1164,77 +1097,9 @@ function renderAuditView(args: AuditRenderArgs): string {
     .map(([sev, n]) => `<span class="summary-badge summary-${sev}">${SEVERITY_LABEL[sev]} ${n}</span>`)
     .join(' ');
 
-  return `<!DOCTYPE html>
-<html lang="pt">
-<head>
-<meta charset="utf-8">
-<title>colab-intelligence — audit</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  * { box-sizing: border-box; }
-  body {
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #0d1117; color: #e6edf3;
-    margin: 0; padding: 24px;
-  }
-  h1, h2 { font-weight: 600; margin: 0 0 16px; }
-  h1 { font-size: 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-  h1 .meta { color: #7d8590; font-size: 12px; font-weight: 400; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: #7d8590; margin-top: 32px; }
-  select, button {
-    background: #21262d; color: #e6edf3; border: 1px solid #30363d;
-    padding: 6px 12px; font: inherit; border-radius: 6px;
-  }
-  button { cursor: pointer; }
-  button.primary { background: #238636; border-color: #2ea043; color: white; }
-  button.primary:hover { background: #2ea043; }
-  .controls { display: flex; gap: 12px; align-items: center; }
-  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #21262d; }
-  .tab { padding: 8px 14px; color: #7d8590; text-decoration: none; font-size: 13px; border-bottom: 2px solid transparent; }
-  .tab:hover { color: #e6edf3; }
-  .tab-active { color: #e6edf3; border-bottom-color: #56d364; }
-  .toast { background: #033a16; border: 1px solid #2ea043; color: #56d364; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; }
-  .summary { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
-  .summary-badge { padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-  .summary-ok { background: #033a16; color: #56d364; }
-  .summary-info { background: #21262d; color: #8b949e; }
-  .summary-warning { background: #4d2d00; color: #e3b341; }
-  .summary-critical { background: #4c1014; color: #f85149; }
-  .resynth-wrap { background: #161b22; border: 1px solid #30363d; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; }
-  .resynth-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .resynth-label { color: #7d8590; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
-  .btn-secondary { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 6px 12px; font: inherit; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  .btn-secondary:hover { background: #30363d; }
-  .audit-section-h { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: #7d8590; margin-top: 24px; margin-bottom: 8px; font-weight: 600; }
-  .checks { display: flex; flex-direction: column; gap: 8px; }
-  .check { background: #161b22; border: 1px solid #30363d; border-left: 3px solid #30363d; border-radius: 6px; padding: 12px 16px; }
-  .check-ok { border-left-color: #56d364; }
-  .check-info { border-left-color: #58a6ff; }
-  .check-warning { border-left-color: #e3b341; }
-  .check-critical { border-left-color: #f85149; }
-  .check-header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
-  .check-severity { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; padding: 2px 8px; border-radius: 4px; background: #21262d; }
-  .check-ok .check-severity { color: #56d364; }
-  .check-info .check-severity { color: #58a6ff; }
-  .check-warning .check-severity { color: #e3b341; }
-  .check-critical .check-severity { color: #f85149; }
-  .check-name { font-weight: 600; flex: 1; }
-  .check-count { font-variant-numeric: tabular-nums; color: #7d8590; font-size: 12px; }
-  .check-message { color: #c9d1d9; font-size: 13px; margin-top: 2px; }
-  .check-hint { margin-top: 6px; font-size: 12px; color: #7d8590; }
-  .check-examples { margin-top: 4px; font-size: 11px; color: #7d8590; font-family: ui-monospace, SFMono-Regular, monospace; }
-</style>
-</head>
-<body>
-<h1>
-  colab-intelligence — audit
-  <span class="meta">${new Date().toLocaleString('pt-PT')}</span>
-</h1>
-
-<nav class="tabs">
-  <a href="/dashboard?empresa=${selected.id}" class="tab">Overview</a>
-  <a href="/dashboard?view=audit&empresa=${selected.id}" class="tab tab-active">Audit</a>
-</nav>
+  const content = `
+<h1 class="page-h">Audit</h1>
+<p class="page-sub">${escapeHtml(selected.name)} — checks de integridade + re-synth selectivo</p>
 
 ${justResynced ? '<div class="toast">✓ Re-synth concluído. Checks abaixo refrescados.</div>' : ''}
 
@@ -1265,6 +1130,12 @@ ${justResynced ? '<div class="toast">✓ Re-synth concluído. Checks abaixo refr
 </div>
 
 ${sections}
+`;
 
-</body></html>`;
+  return renderShell({
+    title: 'Audit',
+    empresaId: selected.id,
+    activePath: 'audit',
+    content,
+  });
 }
