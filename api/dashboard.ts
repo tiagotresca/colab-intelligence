@@ -49,6 +49,35 @@ interface EtlRunRow {
   error_message: string | null;
 }
 
+interface CustomersByPlatform {
+  platform: string;
+  count: number;
+  total_revenue: number;
+}
+
+interface CustomersByConfidence {
+  confidence: string | null;
+  count: number;
+}
+
+interface CustomersBySource {
+  source: string | null;
+  count: number;
+  total_revenue: number;
+}
+
+interface ImportRunRow {
+  source_platform: string;
+  format: string;
+  filename: string | null;
+  rows_processed: number | null;
+  rows_imported: number | null;
+  rows_skipped: number | null;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'POST') {
     const action = (req.query.action as string | undefined) ?? 'trigger-ingest';
@@ -80,6 +109,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let customersCount = 0;
   let metaCampaignsCount = 0;
   let metaInsightsCount = 0;
+  let manualOrdersCount = 0;
+  let customersByPlatform: CustomersByPlatform[] = [];
+  let customersByConfidence: CustomersByConfidence[] = [];
+  let topSources: CustomersBySource[] = [];
+  let recentImports: ImportRunRow[] = [];
   let healthJson: unknown = null;
 
   if (empresa) {
@@ -88,7 +122,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       Date.now() - 30 * 24 * 3600 * 1000,
     ).toISOString();
 
-    const [kpiQ, runsQ, ordersQ, customersQ, metaCampQ, metaInsightsQ] = await Promise.all([
+    const [
+      kpiQ, runsQ, ordersQ, customersQ, metaCampQ, metaInsightsQ,
+      manualOrdersQ, customersAllQ, importRunsQ,
+    ] = await Promise.all([
       supabase
         .from('kpi_snapshots')
         .select('channel, metric_key, period_start, value, meta')
@@ -119,6 +156,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .from('meta_ads_insights_raw')
         .select('campaign_id', { count: 'exact', head: true })
         .eq('empresa_id', empresa.id),
+      supabase
+        .from('manual_orders_raw')
+        .select('external_order_id', { count: 'exact', head: true })
+        .eq('empresa_id', empresa.id),
+      supabase
+        .from('customers')
+        .select('platform, total_revenue, acquisition_source, acquisition_first_touch_confidence')
+        .eq('empresa_id', empresa.id)
+        .limit(50000),
+      supabase
+        .from('import_runs')
+        .select('source_platform, format, filename, rows_processed, rows_imported, rows_skipped, status, started_at, completed_at')
+        .eq('empresa_id', empresa.id)
+        .order('started_at', { ascending: false })
+        .limit(5),
     ]);
 
     kpis = (kpiQ.data ?? []) as KpiRow[];
@@ -127,6 +179,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     customersCount = customersQ.count ?? 0;
     metaCampaignsCount = metaCampQ.count ?? 0;
     metaInsightsCount = metaInsightsQ.count ?? 0;
+    manualOrdersCount = manualOrdersQ.count ?? 0;
+    recentImports = (importRunsQ.data ?? []) as ImportRunRow[];
+
+    // Aggregate customers data in JS (small N)
+    interface CustomerRowLite {
+      platform: string;
+      total_revenue: number | null;
+      acquisition_source: string | null;
+      acquisition_first_touch_confidence: string | null;
+    }
+    const allCustomers = (customersAllQ.data ?? []) as CustomerRowLite[];
+
+    const byPlatform = new Map<string, { count: number; total_revenue: number }>();
+    const byConfidence = new Map<string | null, number>();
+    const bySource = new Map<string | null, { count: number; total_revenue: number }>();
+
+    for (const c of allCustomers) {
+      const rev = Number(c.total_revenue) || 0;
+
+      const p = byPlatform.get(c.platform) ?? { count: 0, total_revenue: 0 };
+      p.count++;
+      p.total_revenue += rev;
+      byPlatform.set(c.platform, p);
+
+      byConfidence.set(
+        c.acquisition_first_touch_confidence,
+        (byConfidence.get(c.acquisition_first_touch_confidence) ?? 0) + 1,
+      );
+
+      const s = bySource.get(c.acquisition_source) ?? { count: 0, total_revenue: 0 };
+      s.count++;
+      s.total_revenue += rev;
+      bySource.set(c.acquisition_source, s);
+    }
+
+    customersByPlatform = Array.from(byPlatform.entries())
+      .map(([platform, v]) => ({ platform, count: v.count, total_revenue: v.total_revenue }))
+      .sort((a, b) => b.count - a.count);
+
+    customersByConfidence = Array.from(byConfidence.entries())
+      .map(([confidence, count]) => ({ confidence, count }))
+      .sort((a, b) => b.count - a.count);
+
+    topSources = Array.from(bySource.entries())
+      .map(([source, v]) => ({ source, count: v.count, total_revenue: v.total_revenue }))
+      .sort((a, b) => b.total_revenue - a.total_revenue)
+      .slice(0, 10);
 
     // Inline call ao MCP get_business_health (mesmo lookup que faz por
     // dentro). Mais simples re-chamar via fetch interno do que duplicar
@@ -143,6 +242,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     customersCount,
     metaCampaignsCount,
     metaInsightsCount,
+    manualOrdersCount,
+    customersByPlatform,
+    customersByConfidence,
+    topSources,
+    recentImports,
     healthJson,
     justTriggered,
     justImported,
@@ -301,13 +405,23 @@ interface RenderArgs {
   customersCount: number;
   metaCampaignsCount: number;
   metaInsightsCount: number;
+  manualOrdersCount: number;
+  customersByPlatform: CustomersByPlatform[];
+  customersByConfidence: CustomersByConfidence[];
+  topSources: CustomersBySource[];
+  recentImports: ImportRunRow[];
   healthJson: unknown;
   justTriggered: boolean;
   justImported: boolean;
 }
 
 function renderDashboard(args: RenderArgs): string {
-  const { empresas, selected, kpis, runs, ordersCount, customersCount, metaCampaignsCount, metaInsightsCount, healthJson, justTriggered, justImported } = args;
+  const {
+    empresas, selected, kpis, runs,
+    ordersCount, customersCount, metaCampaignsCount, metaInsightsCount, manualOrdersCount,
+    customersByPlatform, customersByConfidence, topSources, recentImports,
+    healthJson, justTriggered, justImported,
+  } = args;
 
   const dailyRevenue = kpis.filter((k) => k.channel === 'shopify' && k.metric_key === 'revenue_day');
   const dailyMetaSpend = kpis.filter((k) => k.channel === 'meta_ads' && k.metric_key === 'spend_day');
@@ -443,6 +557,8 @@ function renderDashboard(args: RenderArgs): string {
   .import-status.pending { color: #e3b341; }
   .import-status.success { color: #56d364; }
   .import-status.error { color: #f85149; }
+  .card-sub { color: #7d8590; font-size: 11px; margin-top: 4px; }
+  .sub-h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #7d8590; margin: 16px 0 8px; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -586,10 +702,77 @@ ${hasShopify && hasMeta ? `
 </div>
 ` : ''}
 
+${customersByPlatform.length > 0 ? `
+<h2>Customers (canonical)</h2>
+<div class="cards">
+${customersByPlatform.map((p) => `
+  <div class="card">
+    <div class="label">${escapeHtml(p.platform)}</div>
+    <div class="value">${fmtInt(p.count)}</div>
+    <div class="card-sub">${fmtMoney(p.total_revenue)} lifetime</div>
+  </div>
+`).join('')}
+</div>
+
+<h3 class="sub-h3">Confidence da attribution</h3>
+<div class="raw-counts">
+${customersByConfidence.map((c) => `
+  <div class="item">
+    <div class="label">${escapeHtml(c.confidence ?? 'unknown')}</div>
+    <div class="value">${fmtInt(c.count)}</div>
+  </div>
+`).join('')}
+</div>
+
+<h3 class="sub-h3">Top 10 sources por revenue</h3>
+<table>
+  <thead>
+    <tr><th>source</th><th>customers</th><th>total revenue</th><th>avg revenue</th></tr>
+  </thead>
+  <tbody>
+${topSources.map((s) => `
+    <tr>
+      <td>${escapeHtml(s.source ?? '(null)')}</td>
+      <td>${fmtInt(s.count)}</td>
+      <td>${fmtMoney(s.total_revenue)}</td>
+      <td>${fmtMoney(s.count > 0 ? s.total_revenue / s.count : 0)}</td>
+    </tr>
+`).join('')}
+  </tbody>
+</table>
+` : ''}
+
+${recentImports.length > 0 ? `
+<h2>Últimos imports manuais</h2>
+<table>
+  <thead>
+    <tr><th>quando</th><th>platform</th><th>format</th><th>filename</th><th>status</th><th>imported</th><th>skipped</th></tr>
+  </thead>
+  <tbody>
+${recentImports.map((r) => {
+  const ago = timeAgo(new Date(r.started_at));
+  const statusClass = r.status === 'success' ? 'ok' : r.status === 'failed' ? 'err' : 'warn';
+  return `
+    <tr>
+      <td title="${r.started_at}">${ago}</td>
+      <td>${escapeHtml(r.source_platform)}</td>
+      <td>${escapeHtml(r.format)}</td>
+      <td>${escapeHtml(r.filename ?? '—')}</td>
+      <td><span class="status ${statusClass}">${r.status}</span></td>
+      <td>${fmtInt(r.rows_imported)}</td>
+      <td>${fmtInt(r.rows_skipped)}</td>
+    </tr>
+  `;
+}).join('')}
+  </tbody>
+</table>
+` : ''}
+
 <h2>Raw em DB</h2>
 <div class="raw-counts">
-  <div class="item"><div class="label">Shopify orders</div><div class="value">${fmtInt(ordersCount)}</div></div>
-  <div class="item"><div class="label">Shopify customers</div><div class="value">${fmtInt(customersCount)}</div></div>
+  <div class="item"><div class="label">Shopify orders (API)</div><div class="value">${fmtInt(ordersCount)}</div></div>
+  <div class="item"><div class="label">Shopify customers (API)</div><div class="value">${fmtInt(customersCount)}</div></div>
+  <div class="item"><div class="label">Manual orders (CSV)</div><div class="value">${fmtInt(manualOrdersCount)}</div></div>
   <div class="item"><div class="label">Meta campaigns</div><div class="value">${fmtInt(metaCampaignsCount)}</div></div>
   <div class="item"><div class="label">Meta insights (rows)</div><div class="value">${fmtInt(metaInsightsCount)}</div></div>
 </div>
