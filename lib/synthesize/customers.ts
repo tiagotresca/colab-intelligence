@@ -35,8 +35,10 @@ interface AttributionRow {
   shopify_order_id: number;
   first_touch_source: string | null;
   first_touch_medium: string | null;
+  utm_source: string | null;
   utm_campaign: string | null;
   landing_site: string | null;
+  referring_site: string | null;
   primary_discount_code: string | null;
 }
 
@@ -74,10 +76,14 @@ function hashEmail(email: string): string {
 
 function computeConfidence(
   hasUtm: boolean,
+  hasReferrer: boolean,
   source: string | null,
 ): 'high' | 'medium' | 'low' {
+  // high = UTMs reais no landing_site (capturados via marketing tracking)
+  // medium = referrer externo conhecido (instagram/google/facebook/...) sem UTMs
+  // low = direct ou só source_name=web (sem sinal real de origem)
   if (hasUtm) return 'high';
-  if (source && source !== 'direct') return 'medium';
+  if (hasReferrer && source && source !== 'direct') return 'medium';
   return 'low';
 }
 
@@ -94,7 +100,7 @@ export async function synthesizeCustomersShopify(
       .limit(50000),
     supabase
       .from('shopify_order_attribution')
-      .select('shopify_order_id, first_touch_source, first_touch_medium, utm_campaign, landing_site, primary_discount_code')
+      .select('shopify_order_id, first_touch_source, first_touch_medium, utm_source, utm_campaign, landing_site, referring_site, primary_discount_code')
       .eq('empresa_id', empresa_id)
       .limit(50000),
   ]);
@@ -182,7 +188,8 @@ export async function synthesizeCustomersShopify(
     const totalRevenue = sorted.reduce((sum, o) => sum + o.total_price, 0);
 
     const firstAttr = first.attr;
-    const hasUtm = !!(firstAttr?.utm_campaign || firstAttr?.first_touch_source);
+    const hasUtm = !!(firstAttr?.utm_source || firstAttr?.utm_campaign);
+    const hasReferrer = !!firstAttr?.referring_site;
     const acqSource = firstAttr?.first_touch_source ?? null;
 
     customerRows.push({
@@ -200,7 +207,7 @@ export async function synthesizeCustomersShopify(
       acquisition_campaign: firstAttr?.utm_campaign ?? null,
       acquisition_landing_site: firstAttr?.landing_site ?? null,
       acquisition_discount_code: firstAttr?.primary_discount_code ?? null,
-      acquisition_first_touch_confidence: computeConfidence(hasUtm, acqSource),
+      acquisition_first_touch_confidence: computeConfidence(hasUtm, hasReferrer, acqSource),
       synced_at: now,
     });
   }
