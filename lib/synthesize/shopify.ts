@@ -13,6 +13,7 @@
 
 import crypto from 'node:crypto';
 import { supabase } from '../supabase.js';
+import { assertNoLimitHit } from '../util/limits.js';
 import type { Channel, PeriodGrain } from '../types.js';
 
 const CHANNEL: Channel = 'shopify';
@@ -100,6 +101,9 @@ export async function synthesizeShopify(
   if (apiOrdersQ.error) throw new Error(`synth fetch api orders: ${apiOrdersQ.error.message}`);
   if (manualOrdersQ.error) throw new Error(`synth fetch manual orders: ${manualOrdersQ.error.message}`);
   if (customersQ.error) throw new Error(`synth fetch customers: ${customersQ.error.message}`);
+  assertNoLimitHit(apiOrdersQ.data, 50000, `shopify synth api orders ${empresa_id} ${rangeStart}..${rangeEnd}`);
+  assertNoLimitHit(manualOrdersQ.data, 50000, `shopify synth manual orders ${empresa_id} ${rangeStart}..${rangeEnd}`);
+  assertNoLimitHit(customersQ.data, 100000, `shopify synth customers ${empresa_id}`);
 
   // 3. Build first_order_at lookup
   const firstOrderByEmailHash = new Map<string, string>();

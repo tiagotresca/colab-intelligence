@@ -88,8 +88,43 @@ interface ImportRunRow {
   completed_at: string | null;
 }
 
+// CSRF-style guard: defesa em profundidade por cima do Vercel SSO. Se a
+// sessão SSO for partilhada/comprometida, ainda é preciso conhecer o token
+// (visível só nas páginas autenticadas). Token vem de env DASHBOARD_ACTION_TOKEN
+// — cada page renderiza-o em meta + window.__DASHBOARD_TOKEN para que forms
+// (via query `__token`) e fetch() (via header `x-dashboard-token`) o incluam.
+function getDashboardToken(): string {
+  const t = process.env.DASHBOARD_ACTION_TOKEN;
+  if (!t) {
+    throw new Error('DASHBOARD_ACTION_TOKEN não configurado em env');
+  }
+  return t;
+}
+
+function assertDashboardToken(req: VercelRequest, res: VercelResponse): boolean {
+  let expected: string;
+  try {
+    expected = getDashboardToken();
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'env error',
+    });
+    return false;
+  }
+  const headerToken = req.headers['x-dashboard-token'];
+  const queryToken = req.query.__token;
+  const bodyToken = (req.body as { __dashboard_token?: string } | undefined)?.__dashboard_token;
+  if (headerToken === expected || queryToken === expected || bodyToken === expected) {
+    return true;
+  }
+  res.status(401).json({ ok: false, error: 'Unauthorized — missing or invalid dashboard token' });
+  return false;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'POST') {
+    if (!assertDashboardToken(req, res)) return;
     const action = (req.query.action as string | undefined) ?? 'trigger-ingest';
     if (action === 'import-orders') return handleImport(req, res);
     if (action === 'import-subscriptions') return handleImportSubscriptions(req, res);
@@ -120,6 +155,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const empresa =
     empresas.find((e) => e.id === selectedEmpresaId) ?? empresas[0];
 
+  // Token para CSRF-style guard nos POSTs. Embed em meta + window var
+  // para forms (URL `__token`) e fetch() (header `x-dashboard-token`)
+  // o usarem.
+  let dashboardToken: string;
+  try {
+    dashboardToken = getDashboardToken();
+  } catch (err) {
+    res.status(500).send(
+      `<pre>Erro: ${err instanceof Error ? err.message : 'env error'}</pre>`,
+    );
+    return;
+  }
+
   // ---- Audit view ----------------------------------------------------------
   if (view === 'audit' && empresa) {
     const checks = await runAuditForEmpresa(empresa.id);
@@ -128,6 +176,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       selected: empresa,
       checks,
       justResynced,
+      dashboardToken,
     });
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
@@ -282,6 +331,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     healthJson,
     justTriggered,
     justImported,
+    dashboardToken,
   });
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -583,6 +633,7 @@ interface RenderArgs {
   healthJson: unknown;
   justTriggered: boolean;
   justImported: boolean;
+  dashboardToken: string;
 }
 
 function renderDashboard(args: RenderArgs): string {
@@ -590,7 +641,7 @@ function renderDashboard(args: RenderArgs): string {
     empresas, selected, kpis, runs,
     ordersCount, customersCount, metaCampaignsCount, metaInsightsCount, manualOrdersCount,
     customersByPlatform, customersByConfidence, topSources, recentImports,
-    healthJson, justTriggered, justImported,
+    healthJson, justTriggered, justImported, dashboardToken,
   } = args;
 
   const dailyRevenue = kpis.filter((k) => k.channel === 'shopify' && k.metric_key === 'revenue_day');
@@ -690,7 +741,7 @@ ${selected ? '' : '<p class="muted">Sem empresas ingeridas ainda. Carrega em "Tr
   <label>Empresa:</label>
   <select name="empresa" onchange="this.form.submit()">${empresaOpts || '<option>(nenhuma)</option>'}</select>
   <span style="flex: 1;"></span>
-  <button class="primary" type="submit" formmethod="post" formaction="/dashboard${selected ? `?action=trigger-ingest&empresa=${selected.id}` : '?action=trigger-ingest'}">▶ Trigger ingest</button>
+  <button class="primary" type="submit" formmethod="post" formaction="/dashboard${selected ? `?action=trigger-ingest&empresa=${selected.id}&__token=${encodeURIComponent(dashboardToken)}` : `?action=trigger-ingest&__token=${encodeURIComponent(dashboardToken)}`}">▶ Trigger ingest</button>
 </form>
 
 ${selected ? `
@@ -724,7 +775,10 @@ ${selected ? `
       setStatus('A enviar e processar… (pode demorar para CSVs grandes)', 'pending');
       const r = await fetch('/api/dashboard?action=import-orders&empresa=' + encodeURIComponent(empresaId), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-dashboard-token': window.__DASHBOARD_TOKEN,
+        },
         body: JSON.stringify({
           empresa_id: empresaId,
           source_platform: sourcePlatform,
@@ -781,7 +835,7 @@ ${selected ? `
     try {
       const csv = await file.text();
       setStatus('A enviar e processar subscriptions+subjects…', 'pending');
-      const r = await fetch('/api/dashboard?action=import-subscriptions&empresa=' + encodeURIComponent(empresaId), {
+      const r = await fetch('/api/dashboard?action=import-subscriptions&empresa=' + encodeURIComponent(empresaId) + '&__token=' + encodeURIComponent(window.__DASHBOARD_TOKEN), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -963,6 +1017,7 @@ ${recentImports.map((r) => {
     empresaId: selected ? selected.id : null,
     activePath: 'overview',
     content,
+    dashboardToken,
   });
 }
 
@@ -1016,6 +1071,7 @@ interface AuditRenderArgs {
   selected: EmpresaRow;
   checks: AuditCheck[];
   justResynced: boolean;
+  dashboardToken: string;
 }
 
 const SEVERITY_LABEL: Record<Severity, string> = {
@@ -1035,7 +1091,7 @@ const CATEGORY_LABEL: Record<string, string> = {
 };
 
 function renderAuditView(args: AuditRenderArgs): string {
-  const { empresas, selected, checks, justResynced } = args;
+  const { empresas, selected, checks, justResynced, dashboardToken } = args;
 
   const empresaOpts = empresas
     .map(
@@ -1114,16 +1170,16 @@ ${justResynced ? '<div class="toast">✓ Re-synth concluído. Checks abaixo refr
 <div class="resynth-wrap">
   <div class="resynth-controls">
     <label class="resynth-label">Re-synth selectivo:</label>
-    <form method="post" action="/dashboard?action=resynth-attribution&empresa=${selected.id}" style="display: inline;">
+    <form method="post" action="/dashboard?action=resynth-attribution&empresa=${selected.id}&__token=${encodeURIComponent(dashboardToken)}" style="display: inline;">
       <button class="btn-secondary" type="submit">Re-derive attribution</button>
     </form>
-    <form method="post" action="/dashboard?action=resynth-customers&empresa=${selected.id}" style="display: inline;">
+    <form method="post" action="/dashboard?action=resynth-customers&empresa=${selected.id}&__token=${encodeURIComponent(dashboardToken)}" style="display: inline;">
       <button class="btn-secondary" type="submit">Re-synth customers</button>
     </form>
-    <form method="post" action="/dashboard?action=resynth-kpis&empresa=${selected.id}" style="display: inline;">
+    <form method="post" action="/dashboard?action=resynth-kpis&empresa=${selected.id}&__token=${encodeURIComponent(dashboardToken)}" style="display: inline;">
       <button class="btn-secondary" type="submit">Re-synth KPIs</button>
     </form>
-    <form method="post" action="/dashboard?action=resynth-all&empresa=${selected.id}" style="display: inline;">
+    <form method="post" action="/dashboard?action=resynth-all&empresa=${selected.id}&__token=${encodeURIComponent(dashboardToken)}" style="display: inline;">
       <button class="primary" type="submit">▶ Re-synth tudo (sequencial)</button>
     </form>
   </div>
@@ -1137,5 +1193,6 @@ ${sections}
     empresaId: selected.id,
     activePath: 'audit',
     content,
+    dashboardToken,
   });
 }

@@ -10,6 +10,7 @@
 // Re-correr é seguro e barato.
 
 import { supabase } from '../supabase.js';
+import { assertNoLimitHit } from '../util/limits.js';
 
 interface NoteAttribute {
   name: string;
@@ -226,6 +227,7 @@ export async function deriveAttributionShopify(
   if (ordersErr) {
     throw new Error(`derive attribution fetch orders: ${ordersErr.message}`);
   }
+  assertNoLimitHit(ordersData, 50000, `attribution shopify fetch orders ${empresa_id}`);
   const orders = (ordersData ?? []) as OrderRaw[];
 
   if (orders.length === 0) {

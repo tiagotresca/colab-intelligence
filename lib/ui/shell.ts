@@ -23,10 +23,13 @@ export interface ShellArgs {
   empresaId: string | null;
   activePath: 'overview' | 'audit';
   content: string; // HTML do main content
+  // Token usado para autorizar POSTs do dashboard (CSRF-style). Embutido em
+  // <meta> + window.__DASHBOARD_TOKEN para forms HTML e fetch() apanharem.
+  dashboardToken: string;
 }
 
 export function renderShell(args: ShellArgs): string {
-  const { title, empresaId, activePath, content } = args;
+  const { title, empresaId, activePath, content, dashboardToken } = args;
 
   const navItems: SidebarItem[] = empresaId
     ? [
@@ -68,9 +71,11 @@ export function renderShell(args: ShellArgs): string {
 <meta charset="utf-8">
 <title>${escape(title)} — colab-intelligence</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="dashboard-token" content="${escape(dashboardToken)}">
 <link rel="preconnect" href="https://rsms.me/">
 <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
 <style>${DESIGN_SYSTEM_CSS}</style>
+<script>window.__DASHBOARD_TOKEN = ${JSON.stringify(dashboardToken)};</script>
 </head>
 <body>
 <div class="app-layout">

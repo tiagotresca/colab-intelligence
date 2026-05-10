@@ -15,6 +15,7 @@
 
 import { supabase } from '../supabase.js';
 import type { Channel, PeriodGrain } from '../types.js';
+import { assertNoLimitHit } from '../util/limits.js';
 
 const CHANNEL: Channel = 'ga4';
 const GRAIN: PeriodGrain = 'day';
@@ -97,6 +98,7 @@ export async function synthesizeGA4(
   if (metricsErr) {
     throw new Error(`synthesize GA4 fetch metrics: ${metricsErr.message}`);
   }
+  assertNoLimitHit(metricsData, 50000, `ga4 synthesize metrics ${empresa_id} ${sinceDate}..${untilDate}`);
   const metrics = (metricsData ?? []) as MetricsRow[];
 
   // 2. Channel breakdown (último valor para cada (date, channel) — já é unique pk)
@@ -111,6 +113,7 @@ export async function synthesizeGA4(
   if (channelErr) {
     throw new Error(`synthesize GA4 fetch channels: ${channelErr.message}`);
   }
+  assertNoLimitHit(channelData, 50000, `ga4 synthesize channels ${empresa_id} ${sinceDate}..${untilDate}`);
   const channels = (channelData ?? []) as ChannelRow[];
 
   if (metrics.length === 0 && channels.length === 0) {

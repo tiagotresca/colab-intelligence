@@ -14,6 +14,7 @@
 
 import crypto from 'node:crypto';
 import { supabase } from '../supabase.js';
+import { assertNoLimitHit } from '../util/limits.js';
 
 const SHOPIFY_PLATFORM = 'shopify' as const;
 const SHOPIFY_BACKFILL_SOURCE = 'shopify_export' as const;
@@ -186,6 +187,9 @@ export async function synthesizeCustomersShopify(
   if (ordersQ.error) throw new Error(`fetch api orders: ${ordersQ.error.message}`);
   if (attrQ.error) throw new Error(`fetch attribution: ${attrQ.error.message}`);
   if (manualQ.error) throw new Error(`fetch manual orders: ${manualQ.error.message}`);
+  assertNoLimitHit(ordersQ.data, 50000, `customers synth api orders ${empresa_id}`);
+  assertNoLimitHit(attrQ.data, 50000, `customers synth attribution ${empresa_id}`);
+  assertNoLimitHit(manualQ.data, 100000, `customers synth manual orders ${empresa_id}`);
 
   const apiOrders = (ordersQ.data ?? []) as ApiOrderRow[];
   const attributions = (attrQ.data ?? []) as AttributionRow[];
@@ -338,6 +342,7 @@ export async function synthesizeCustomersFromManual(
     .limit(100000);
 
   if (error) throw new Error(`fetch manual orders (${source_platform}): ${error.message}`);
+  assertNoLimitHit(data, 100000, `customers synth manual orders custom ${empresa_id} ${source_platform}`);
 
   const manualOrders = (data ?? []) as ManualOrderRow[];
   let skippedNoEmail = 0;

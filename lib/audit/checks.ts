@@ -10,6 +10,7 @@
 // isolated por check).
 
 import { supabase } from '../supabase.js';
+import { assertNoLimitHit } from '../util/limits.js';
 
 export type Severity = 'ok' | 'info' | 'warning' | 'critical';
 
@@ -78,6 +79,8 @@ async function checkCustomersConsistency(empresa_id: string): Promise<AuditCheck
       .limit(100000),
   ]);
 
+  assertNoLimitHit(apiOrdersDistinct.data, 50000, `audit checkCustomerCoverage api orders ${empresa_id}`);
+  assertNoLimitHit(manualOrdersDistinct.data, 100000, `audit checkCustomerCoverage manual orders ${empresa_id}`);
   const customerCount = customersC.count ?? 0;
   const apiEmails = new Set(
     ((apiOrdersDistinct.data ?? []) as Array<{ email: string }>)
@@ -227,6 +230,8 @@ async function checkSourceOverlap(empresa_id: string): Promise<AuditCheck> {
       .limit(100000),
   ]);
 
+  assertNoLimitHit(apiQ.data, 100000, `audit checkSourceOverlap api orders ${empresa_id}`);
+  assertNoLimitHit(manualQ.data, 100000, `audit checkSourceOverlap manual orders ${empresa_id}`);
   const apiIds = new Set(
     ((apiQ.data ?? []) as Array<{ shopify_order_id: number }>)
       .map((r) => String(r.shopify_order_id)),
@@ -317,6 +322,8 @@ async function checkKpiRevenueSanity(empresa_id: string): Promise<AuditCheck> {
       .limit(50000),
   ]);
 
+  assertNoLimitHit(apiQ.data, 50000, `audit revenue api orders ${empresa_id} since ${since}`);
+  assertNoLimitHit(manualQ.data, 50000, `audit revenue manual orders ${empresa_id} since ${since}`);
   const REVENUE_STATUSES = new Set(['paid', 'partially_refunded']);
   const apiOrders = (apiQ.data ?? []) as Array<{
     shopify_order_id: number;
@@ -406,6 +413,9 @@ async function checkModulesHealth(empresa_id: string): Promise<AuditCheck | null
       .limit(5000),
   ]);
 
+  assertNoLimitHit(subsQ.data, 50000, `audit modules subscriptions ${empresa_id}`);
+  // orphanQ tem .limit(5000) mas é intencionalmente baixo (top-N orphans
+  // para mostrar exemplos no audit, não para análise). Não alarmar.
   const subsCount = subsQ.count ?? 0;
   const subjsCount = subjQ.count ?? 0;
 

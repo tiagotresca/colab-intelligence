@@ -14,6 +14,7 @@
 
 import { supabase } from '../supabase.js';
 import type { Channel, PeriodGrain } from '../types.js';
+import { assertNoLimitHit } from '../util/limits.js';
 
 const CHANNEL: Channel = 'meta_ads';
 const GRAIN: PeriodGrain = 'day';
@@ -74,6 +75,7 @@ export async function synthesizeMetaAds(
   if (insightsErr) {
     throw new Error(`synthesize Meta fetch insights: ${insightsErr.message}`);
   }
+  assertNoLimitHit(insightsData, 50000, `meta synthesize insights ${empresa_id} ${sinceDate}..${untilDate}`);
   const insights = (insightsData ?? []) as InsightRow[];
 
   if (insights.length === 0) {
