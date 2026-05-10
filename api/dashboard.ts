@@ -20,6 +20,11 @@ import { listEmpresasWithShopify } from '../lib/shopify.js';
 import { ingestShopifyEmpresa } from '../lib/ingest/shopify.js';
 import { listEmpresasWithMetaAds } from '../lib/meta-ads.js';
 import { ingestMetaAdsEmpresa } from '../lib/ingest/meta-ads.js';
+import { importOrders } from '../lib/import/orders-importer.js';
+import {
+  synthesizeCustomersShopify,
+  synthesizeCustomersFromManual,
+} from '../lib/synthesize/customers.js';
 
 interface EmpresaRow {
   id: string;
@@ -46,12 +51,15 @@ interface EtlRunRow {
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'POST') {
+    const action = (req.query.action as string | undefined) ?? 'trigger-ingest';
+    if (action === 'import-orders') return handleImport(req, res);
     return handleTrigger(req, res);
   }
 
   // GET — render
   const selectedEmpresaId = (req.query.empresa as string | undefined)?.trim();
   const justTriggered = req.query.triggered === '1';
+  const justImported = req.query.imported === '1';
 
   const { data: empresasData, error: empresasErr } = await supabase
     .from('empresas')
@@ -137,6 +145,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     metaInsightsCount,
     healthJson,
     justTriggered,
+    justImported,
   });
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -172,6 +181,70 @@ async function handleTrigger(req: VercelRequest, res: VercelResponse) {
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'erro desconhecido';
     res.status(500).send(`Trigger failed: ${msg}`);
+  }
+}
+
+// ---- Manual import handler -------------------------------------------------
+
+interface ImportRequestBody {
+  empresa_id?: string;
+  source_platform?: string;
+  format?: 'shopify_csv' | 'standard_v1';
+  filename?: string;
+  csv_content?: string;
+}
+
+async function handleImport(req: VercelRequest, res: VercelResponse) {
+  const body = (req.body ?? {}) as ImportRequestBody;
+  const empresa_id = body.empresa_id?.trim();
+  const source_platform = body.source_platform?.trim();
+  const format = body.format;
+  const csv_content = body.csv_content;
+
+  if (!empresa_id || !source_platform || !format || !csv_content) {
+    res.status(400).json({
+      ok: false,
+      error: 'missing fields: empresa_id, source_platform, format, csv_content',
+    });
+    return;
+  }
+  if (format !== 'shopify_csv' && format !== 'standard_v1') {
+    res.status(400).json({ ok: false, error: 'invalid format' });
+    return;
+  }
+
+  try {
+    const result = await importOrders({
+      empresa_id,
+      source_platform,
+      format,
+      filename: body.filename ?? null,
+      csv_content,
+    });
+
+    // Trigger customers re-synth for the affected platform
+    let synthResult;
+    try {
+      if (source_platform === 'shopify_export') {
+        synthResult = await synthesizeCustomersShopify(empresa_id);
+      } else {
+        synthResult = await synthesizeCustomersFromManual(empresa_id, source_platform);
+      }
+    } catch (err) {
+      // Import succeeded; flag synth failure separately
+      synthResult = {
+        error: err instanceof Error ? err.message : 'synth failed',
+      };
+    }
+
+    res.status(200).json({
+      ok: true,
+      import: result,
+      customers_synth: synthResult,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'erro desconhecido';
+    res.status(500).json({ ok: false, error: msg });
   }
 }
 
@@ -230,10 +303,11 @@ interface RenderArgs {
   metaInsightsCount: number;
   healthJson: unknown;
   justTriggered: boolean;
+  justImported: boolean;
 }
 
 function renderDashboard(args: RenderArgs): string {
-  const { empresas, selected, kpis, runs, ordersCount, customersCount, metaCampaignsCount, metaInsightsCount, healthJson, justTriggered } = args;
+  const { empresas, selected, kpis, runs, ordersCount, customersCount, metaCampaignsCount, metaInsightsCount, healthJson, justTriggered, justImported } = args;
 
   const dailyRevenue = kpis.filter((k) => k.channel === 'shopify' && k.metric_key === 'revenue_day');
   const dailyMetaSpend = kpis.filter((k) => k.channel === 'meta_ads' && k.metric_key === 'spend_day');
@@ -360,6 +434,15 @@ function renderDashboard(args: RenderArgs): string {
   summary { cursor: pointer; color: #7d8590; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
   pre { background: #0d1117; padding: 16px; border-radius: 6px; overflow: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 12px 0 0; }
   .toast { background: #033a16; border: 1px solid #2ea043; color: #56d364; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; }
+  .import-wrap { background: #161b22; border: 1px solid #30363d; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; }
+  .import-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .import-label { color: #7d8590; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  .btn-secondary { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 6px 12px; font: inherit; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .btn-secondary:hover { background: #30363d; }
+  .import-status { font-size: 12px; color: #7d8590; margin-left: auto; }
+  .import-status.pending { color: #e3b341; }
+  .import-status.success { color: #56d364; }
+  .import-status.error { color: #f85149; }
 </style>
 </head>
 <body>
@@ -369,14 +452,97 @@ function renderDashboard(args: RenderArgs): string {
 </h1>
 
 ${justTriggered ? '<div class="toast">✓ Ingest disparado. Resultados refrescados em baixo.</div>' : ''}
+${justImported ? '<div class="toast">✓ Import concluído. Customers re-sintetizados.</div>' : ''}
 ${selected ? '' : '<p class="muted">Sem empresas ingeridas ainda. Carrega em "Trigger ingest" para correr o primeiro ETL.</p>'}
 
-<form method="get" action="/dashboard" class="controls" style="margin-bottom: 24px;">
+<form method="get" action="/dashboard" class="controls" style="margin-bottom: 12px;">
   <label>Empresa:</label>
   <select name="empresa" onchange="this.form.submit()">${empresaOpts || '<option>(nenhuma)</option>'}</select>
   <span style="flex: 1;"></span>
-  <button class="primary" type="submit" formmethod="post" formaction="/dashboard${selected ? `?empresa=${selected.id}` : ''}">▶ Trigger ingest</button>
+  <button class="primary" type="submit" formmethod="post" formaction="/dashboard${selected ? `?action=trigger-ingest&empresa=${selected.id}` : '?action=trigger-ingest'}">▶ Trigger ingest</button>
 </form>
+
+${selected ? `
+<div class="import-wrap" id="import-wrap">
+  <div class="import-controls">
+    <label class="import-label">Manual import:</label>
+    <button class="btn-secondary" type="button" onclick="document.getElementById('csv-input-shopify').click()">⬆ Shopify export (CSV)</button>
+    <button class="btn-secondary" type="button" onclick="promptCustomImport()">⬆ Custom site CSV</button>
+    <input type="file" id="csv-input-shopify" accept=".csv,text/csv" hidden>
+    <input type="file" id="csv-input-custom" accept=".csv,text/csv" hidden>
+    <span id="import-status" class="import-status"></span>
+  </div>
+</div>
+<script>
+(function() {
+  const empresaId = ${JSON.stringify(selected.id)};
+  const status = document.getElementById('import-status');
+
+  function setStatus(msg, kind) {
+    status.textContent = msg;
+    status.className = 'import-status' + (kind ? ' ' + kind : '');
+  }
+
+  async function uploadCsv(file, sourcePlatform, format) {
+    if (!file) return;
+    setStatus('A ler ' + file.name + ' (' + (file.size / 1024).toFixed(0) + ' KB)…', 'pending');
+    try {
+      const csv = await file.text();
+      setStatus('A enviar e processar… (pode demorar para CSVs grandes)', 'pending');
+      const r = await fetch('/api/dashboard?action=import-orders&empresa=' + encodeURIComponent(empresaId), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          empresa_id: empresaId,
+          source_platform: sourcePlatform,
+          format: format,
+          filename: file.name,
+          csv_content: csv,
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) {
+        const err = (j && j.error) || ('HTTP ' + r.status);
+        setStatus('✗ Falhou: ' + err, 'error');
+        return;
+      }
+      const imp = j.import;
+      const synth = j.customers_synth;
+      const synthMsg = synth && synth.customers_synthesized != null
+        ? (synth.customers_synthesized + ' customers')
+        : 'sem synth';
+      setStatus('✓ ' + imp.rows_imported + '/' + imp.rows_processed + ' orders importados (' + imp.rows_skipped + ' skipped). ' + synthMsg + '. A refrescar…', 'success');
+      setTimeout(function() {
+        location.href = '/dashboard?empresa=' + encodeURIComponent(empresaId) + '&imported=1';
+      }, 1500);
+    } catch (err) {
+      setStatus('✗ Falhou: ' + (err.message || err), 'error');
+    }
+  }
+
+  document.getElementById('csv-input-shopify').addEventListener('change', function(e) {
+    if (!e.target.files[0]) return;
+    uploadCsv(e.target.files[0], 'shopify_export', 'shopify_csv');
+    e.target.value = '';
+  });
+
+  document.getElementById('csv-input-custom').addEventListener('change', function(e) {
+    if (!e.target.files[0]) return;
+    const sp = window._customSourcePlatform;
+    if (!sp) return;
+    uploadCsv(e.target.files[0], sp, 'standard_v1');
+    e.target.value = '';
+  });
+
+  window.promptCustomImport = function() {
+    const sp = prompt('Source platform (ex: aquinta_custom, lukydog_custom):', 'aquinta_custom');
+    if (!sp) return;
+    window._customSourcePlatform = sp.trim();
+    document.getElementById('csv-input-custom').click();
+  };
+})();
+</script>
+` : ''}
 
 ${selected ? `
 ${hasShopify ? `
