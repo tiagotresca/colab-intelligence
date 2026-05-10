@@ -376,9 +376,18 @@ async function computeBusinessHealth(empresa: EmpresaRow) {
     const a = byMetric.get(k);
     return a && a.length ? a.reduce((s, r) => s + r.value, 0) : null;
   };
-  const avgOf = (k: string) => {
+  const weightedRatioOf = (k: string) => {
     const a = byMetric.get(k);
-    return a && a.length ? a.reduce((s, r) => s + r.value, 0) / a.length : null;
+    if (!a || a.length === 0) return null;
+    let num = 0, den = 0;
+    for (const r of a) {
+      const meta = r.meta as { numerator?: number; denominator?: number } | null;
+      if (meta && typeof meta.numerator === 'number' && typeof meta.denominator === 'number') {
+        num += meta.numerator;
+        den += meta.denominator;
+      }
+    }
+    return den > 0 ? num / den : null;
   };
   const revenue = sumOf('revenue_day');
   const orders = sumOf('orders_count_day');
@@ -389,7 +398,7 @@ async function computeBusinessHealth(empresa: EmpresaRow) {
     orders_30d: orders,
     aov_30d: revenue != null && orders ? revenue / orders : null,
     new_customers_30d: sumOf('new_customers_day'),
-    repeat_purchase_rate_30d: avgOf('repeat_purchase_rate_day'),
+    repeat_purchase_rate_30d: weightedRatioOf('repeat_purchase_rate_day'),
     currency: byMetric.get('revenue_day')?.[0]?.meta?.currency ?? null,
   };
 }
@@ -433,17 +442,25 @@ function renderDashboard(args: RenderArgs): string {
     if (rows.length === 0) return null;
     return rows.reduce((s, r) => s + (Number(r.value) || 0), 0);
   };
-  const avgOf = (channel: string, key: string): number | null => {
+  const weightedRatioOf = (channel: string, key: string): number | null => {
     const rows = kpis.filter((k) => k.channel === channel && k.metric_key === key);
     if (rows.length === 0) return null;
-    return rows.reduce((s, r) => s + (Number(r.value) || 0), 0) / rows.length;
+    let num = 0, den = 0;
+    for (const r of rows) {
+      const meta = r.meta as { numerator?: number; denominator?: number } | null;
+      if (meta && typeof meta.numerator === 'number' && typeof meta.denominator === 'number') {
+        num += meta.numerator;
+        den += meta.denominator;
+      }
+    }
+    return den > 0 ? num / den : null;
   };
 
   // Shopify
   const revenue30d = sumOf('shopify', 'revenue_day');
   const orders30d = sumOf('shopify', 'orders_count_day');
   const newCust30d = sumOf('shopify', 'new_customers_day');
-  const repeat30d = avgOf('shopify', 'repeat_purchase_rate_day');
+  const repeat30d = weightedRatioOf('shopify', 'repeat_purchase_rate_day');
   const aov30d = revenue30d != null && orders30d ? revenue30d / orders30d : null;
 
   // Meta Ads

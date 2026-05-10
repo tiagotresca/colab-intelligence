@@ -76,11 +76,22 @@ async function getBusinessHealth(
     if (!rows || rows.length === 0) return null;
     return rows.reduce((s, r) => s + (Number(r.value) || 0), 0);
   };
-  const avgOf = (channel: string, key: string): number | null => {
+  // weightedRatioOf: para KPIs de rácio diário, agrega correctamente como
+  // sum(numerator) ÷ sum(denominator) em vez de média de rácios.
+  // O daily synth guarda numerator e denominator no meta.
+  const weightedRatioOf = (channel: string, key: string): number | null => {
     const rows = byKey.get(`${channel}:${key}`);
     if (!rows || rows.length === 0) return null;
-    const sum = rows.reduce((s, r) => s + (Number(r.value) || 0), 0);
-    return sum / rows.length;
+    let num = 0;
+    let den = 0;
+    for (const r of rows) {
+      const meta = r.meta as { numerator?: number; denominator?: number } | null;
+      if (meta && typeof meta.numerator === 'number' && typeof meta.denominator === 'number') {
+        num += meta.numerator;
+        den += meta.denominator;
+      }
+    }
+    return den > 0 ? num / den : null;
   };
 
   // ---- Shopify aggregations
@@ -91,7 +102,10 @@ async function getBusinessHealth(
       ? revenue_30d / orders_30d
       : null;
   const new_customers_30d = sumOf('shopify', 'new_customers_day');
-  const repeat_purchase_rate_30d = avgOf('shopify', 'repeat_purchase_rate_day');
+  // Weighted ratio: sum(repeat orders) ÷ sum(orders with email) across 30d.
+  // Mathematically distinto de avg de daily rates — bate com a definição
+  // de "returning customer rate" da Shopify.
+  const repeat_purchase_rate_30d = weightedRatioOf('shopify', 'repeat_purchase_rate_day');
 
   // ---- Meta Ads aggregations
   const meta_spend_30d = sumOf('meta_ads', 'spend_day');

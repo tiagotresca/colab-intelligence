@@ -1,35 +1,34 @@
-// Synthesize layer — Shopify.
+// Synthesize layer — Shopify KPIs.
 //
-// Lê das tabelas raw (shopify_orders_raw, shopify_customers_raw) e
-// produz KPIs derivados em kpi_snapshots. Função pura — não chama a
-// Shopify API, só faz queries à nossa DB.
+// Lê orders de DUAS fontes (API + manual import), dedupe por order_id
+// (API ganha), e produz KPIs diários em kpi_snapshots.
 //
-// Janela fixa (default 30d) independente do range de ingest:
-// re-computa todo o histórico relevante em cada run. Idempotente
-// (unique constraint em kpi_snapshots), portanto re-correr é seguro
-// e barato. Phase 2+ podemos passar a janela maior para suportar
-// trend analysis ou tornar configurável por canal.
+// Para classificação new-vs-returning a nível de order, lê
+// first_order_at da tabela canonical `customers` (que já está
+// sintetizada antes desta função correr — ver lib/ingest/shopify.ts
+// step 5b → 5c).
 //
-// Phase 1: 5 KPIs base, granularidade diária. Adicionar KPI = nova
-// entry no compute loop. Adicionar canal = lib/synthesize/<canal>.ts.
+// Janela 30d (default), recomputa todo o histórico relevante em cada
+// run. Idempotente.
 
+import crypto from 'node:crypto';
 import { supabase } from '../supabase.js';
 import type { Channel, PeriodGrain } from '../types.js';
 
 const CHANNEL: Channel = 'shopify';
 const GRAIN: PeriodGrain = 'day';
 const DEFAULT_LOOKBACK_DAYS = 30;
+const SHOPIFY_BACKFILL_SOURCE = 'shopify_export';
 
-// Status que contam para revenue. Refunded = 0, paid e
-// partially_refunded contam (com total_price líquido reportado).
 const REVENUE_STATUSES = new Set(['paid', 'partially_refunded']);
 
+// Order shape unificado (ambas as fontes mapeadas para isto)
 interface OrderRow {
-  shopify_order_id: number;
+  external_id: string;       // shopify_order_id (string) ou external_order_id
+  email: string | null;
   created_at: string;
   total_price: number | null;
   financial_status: string | null;
-  customer_id: number | null;
   currency: string | null;
 }
 
@@ -53,6 +52,13 @@ export interface SynthesizeOptions {
   lookback_days?: number;
 }
 
+function hashEmail(email: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(email.trim().toLowerCase())
+    .digest('hex');
+}
+
 export async function synthesizeShopify(
   empresa_id: string,
   options: SynthesizeOptions = {},
@@ -64,24 +70,94 @@ export async function synthesizeShopify(
     now.getTime() - lookback * 24 * 3600 * 1000,
   ).toISOString();
 
-  // 1. Fetch orders dentro do range. Limit alto — para >50k orders
-  // numa empresa grande, paginar (TODO Phase 1.5).
-  const { data: ordersData, error: ordersErr } = await supabase
-    .from('shopify_orders_raw')
-    .select(
-      'shopify_order_id, created_at, total_price, financial_status, customer_id, currency',
-    )
-    .eq('empresa_id', empresa_id)
-    .gte('created_at', rangeStart)
-    .lt('created_at', rangeEnd)
-    .limit(50000);
+  // 1. Fetch orders no range de ambas as fontes em paralelo.
+  // 2. Fetch first_order_at por email_hash da customers table
+  //    (canonical, lifetime, já fundida pelo synth de customers).
+  const [apiOrdersQ, manualOrdersQ, customersQ] = await Promise.all([
+    supabase
+      .from('shopify_orders_raw')
+      .select('shopify_order_id, email, created_at, total_price, financial_status, currency')
+      .eq('empresa_id', empresa_id)
+      .gte('created_at', rangeStart)
+      .lt('created_at', rangeEnd)
+      .limit(50000),
+    supabase
+      .from('manual_orders_raw')
+      .select('external_order_id, email, created_at, total_price, financial_status, currency')
+      .eq('empresa_id', empresa_id)
+      .eq('source_platform', SHOPIFY_BACKFILL_SOURCE)
+      .gte('created_at', rangeStart)
+      .lt('created_at', rangeEnd)
+      .limit(50000),
+    supabase
+      .from('customers')
+      .select('email_hash, first_order_at')
+      .eq('empresa_id', empresa_id)
+      .eq('platform', 'shopify')
+      .limit(100000),
+  ]);
 
-  if (ordersErr) {
-    throw new Error(`synthesize fetch orders falhou: ${ordersErr.message}`);
+  if (apiOrdersQ.error) throw new Error(`synth fetch api orders: ${apiOrdersQ.error.message}`);
+  if (manualOrdersQ.error) throw new Error(`synth fetch manual orders: ${manualOrdersQ.error.message}`);
+  if (customersQ.error) throw new Error(`synth fetch customers: ${customersQ.error.message}`);
+
+  // 3. Build first_order_at lookup
+  const firstOrderByEmailHash = new Map<string, string>();
+  for (const c of (customersQ.data ?? []) as Array<{
+    email_hash: string;
+    first_order_at: string | null;
+  }>) {
+    if (c.first_order_at) firstOrderByEmailHash.set(c.email_hash, c.first_order_at);
   }
-  const orders = (ordersData ?? []) as OrderRow[];
 
-  if (orders.length === 0) {
+  // 4. Combine orders, dedup by order id (API wins)
+  type ApiOrder = {
+    shopify_order_id: number;
+    email: string | null;
+    created_at: string;
+    total_price: number | null;
+    financial_status: string | null;
+    currency: string | null;
+  };
+  type ManualOrder = {
+    external_order_id: string;
+    email: string | null;
+    created_at: string;
+    total_price: number | null;
+    financial_status: string | null;
+    currency: string | null;
+  };
+  const apiOrders = (apiOrdersQ.data ?? []) as ApiOrder[];
+  const manualOrders = (manualOrdersQ.data ?? []) as ManualOrder[];
+
+  const combined: OrderRow[] = [];
+  const seenIds = new Set<string>();
+
+  for (const o of apiOrders) {
+    const id = String(o.shopify_order_id);
+    seenIds.add(id);
+    combined.push({
+      external_id: id,
+      email: o.email,
+      created_at: o.created_at,
+      total_price: o.total_price,
+      financial_status: o.financial_status,
+      currency: o.currency,
+    });
+  }
+  for (const o of manualOrders) {
+    if (seenIds.has(o.external_order_id)) continue;
+    combined.push({
+      external_id: o.external_order_id,
+      email: o.email,
+      created_at: o.created_at,
+      total_price: o.total_price,
+      financial_status: o.financial_status,
+      currency: o.currency,
+    });
+  }
+
+  if (combined.length === 0) {
     return {
       days_computed: 0,
       kpis_upserted: 0,
@@ -89,41 +165,16 @@ export async function synthesizeShopify(
     };
   }
 
-  // 2. Para cada customer, descobrir a data do PRIMEIRO order alguma
-  // vez (across full raw da empresa, não só do range). Usado para
-  // classificar new vs returning. Limite alto idem.
-  const { data: histData, error: histErr } = await supabase
-    .from('shopify_orders_raw')
-    .select('customer_id, created_at')
-    .eq('empresa_id', empresa_id)
-    .not('customer_id', 'is', null)
-    .order('created_at', { ascending: true })
-    .limit(50000);
-
-  if (histErr) {
-    throw new Error(`synthesize fetch first orders falhou: ${histErr.message}`);
-  }
-
-  const firstOrderByCustomer = new Map<number, string>();
-  for (const row of (histData ?? []) as Array<{
-    customer_id: number;
-    created_at: string;
-  }>) {
-    if (!firstOrderByCustomer.has(row.customer_id)) {
-      firstOrderByCustomer.set(row.customer_id, row.created_at);
-    }
-  }
-
-  // 3. Agrupar orders por dia UTC (YYYY-MM-DD)
+  // 5. Group by day
   const byDay = new Map<string, OrderRow[]>();
-  for (const o of orders) {
+  for (const o of combined) {
     const day = o.created_at.slice(0, 10);
     const bucket = byDay.get(day);
     if (bucket) bucket.push(o);
     else byDay.set(day, [o]);
   }
 
-  // 4. Computar KPIs por dia
+  // 6. Compute daily KPIs
   const kpiRows: KpiRow[] = [];
   for (const [day, dayOrders] of byDay) {
     const periodStart = `${day}T00:00:00.000Z`;
@@ -138,28 +189,31 @@ export async function synthesizeShopify(
     const orders_count = dayOrders.length;
     const aov = orders_count > 0 ? revenue / orders_count : 0;
 
-    const distinctCustomers = new Set<number>();
+    // Customer-level e order-level classification usando email_hash
+    // como chave (uniforme entre API e manual).
+    const distinctEmails = new Set<string>();
+    let ordersWithEmail = 0;
+    let repeatOrdersCount = 0;
     for (const o of dayOrders) {
-      if (o.customer_id != null) distinctCustomers.add(o.customer_id);
+      if (!o.email) continue;
+      ordersWithEmail++;
+      const hash = hashEmail(o.email);
+      distinctEmails.add(hash);
+      const firstAt = firstOrderByEmailHash.get(hash);
+      // "Repeat" = este order não é o primeiro ever do customer.
+      // Comparação de timestamps strict — se o primeiro EVER é este,
+      // first === created_at (e este conta como new).
+      if (firstAt && firstAt < o.created_at) repeatOrdersCount++;
     }
 
     let new_customers = 0;
-    for (const cid of distinctCustomers) {
-      const first = firstOrderByCustomer.get(cid);
-      if (first && first.slice(0, 10) === day) new_customers++;
+    for (const hash of distinctEmails) {
+      const firstAt = firstOrderByEmailHash.get(hash);
+      if (firstAt && firstAt.slice(0, 10) === day) new_customers++;
     }
 
-    const ordersWithCustomer = dayOrders.filter((o) => o.customer_id != null);
-    let repeatOrdersCount = 0;
-    for (const o of ordersWithCustomer) {
-      const first = firstOrderByCustomer.get(o.customer_id as number);
-      // "repeat" = este order não é o primeiro ever do customer
-      if (first && first < o.created_at) repeatOrdersCount++;
-    }
     const repeat_purchase_rate =
-      ordersWithCustomer.length > 0
-        ? repeatOrdersCount / ordersWithCustomer.length
-        : 0;
+      ordersWithEmail > 0 ? repeatOrdersCount / ordersWithEmail : 0;
 
     const currency = dayOrders.find((o) => o.currency)?.currency ?? null;
     const baseFields = {
@@ -197,7 +251,7 @@ export async function synthesizeShopify(
       ...baseFields,
       metric_key: 'repeat_purchase_rate_day',
       value: repeat_purchase_rate,
-      meta: { numerator: repeatOrdersCount, denominator: ordersWithCustomer.length },
+      meta: { numerator: repeatOrdersCount, denominator: ordersWithEmail },
     });
   }
 
@@ -209,14 +263,13 @@ export async function synthesizeShopify(
     };
   }
 
-  // 5. Upsert. Unique constraint trata da idempotência.
   const { error: upsertErr } = await supabase
     .from('kpi_snapshots')
     .upsert(kpiRows, {
       onConflict: 'empresa_id,channel,metric_key,period_grain,period_start',
     });
   if (upsertErr) {
-    throw new Error(`upsert kpi_snapshots falhou: ${upsertErr.message}`);
+    throw new Error(`upsert kpi_snapshots: ${upsertErr.message}`);
   }
 
   return {
