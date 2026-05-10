@@ -468,7 +468,7 @@ async function checkEtlStale(empresa_id: string): Promise<AuditCheck> {
     .select('channel, status, started_at, completed_at, error_message')
     .eq('empresa_id', empresa_id)
     .order('started_at', { ascending: false })
-    .limit(20);
+    .limit(50);
 
   const runs = (lastRuns ?? []) as Array<{
     channel: string;
@@ -488,16 +488,19 @@ async function checkEtlStale(empresa_id: string): Promise<AuditCheck> {
     };
   }
 
-  // Latest success per channel
-  const latestSuccessByChannel = new Map<string, Date>();
-  const latestFailedByChannel = new Map<string, { at: Date; error: string | null }>();
+  // Most recent run state per channel. Se a mais recente é success,
+  // falhas antigas são irrelevantes — o canal recuperou.
+  interface ChannelState {
+    status: string;
+    at: Date;
+    error: string | null;
+  }
+  const latestRunByChannel = new Map<string, ChannelState>();
   for (const r of runs) {
-    if (r.status === 'success' && !latestSuccessByChannel.has(r.channel)) {
-      latestSuccessByChannel.set(r.channel, new Date(r.completed_at ?? r.started_at));
-    }
-    if (r.status === 'failed' && !latestFailedByChannel.has(r.channel)) {
-      latestFailedByChannel.set(r.channel, {
-        at: new Date(r.started_at),
+    if (!latestRunByChannel.has(r.channel)) {
+      latestRunByChannel.set(r.channel, {
+        status: r.status,
+        at: new Date(r.completed_at ?? r.started_at),
         error: r.error_message,
       });
     }
@@ -505,34 +508,38 @@ async function checkEtlStale(empresa_id: string): Promise<AuditCheck> {
 
   const now = Date.now();
   const stale: string[] = [];
-  for (const [channel, when] of latestSuccessByChannel) {
-    const hoursAgo = (now - when.getTime()) / (1000 * 3600);
+  const failed: string[] = [];
+
+  for (const [channel, state] of latestRunByChannel) {
+    if (state.status === 'failed') {
+      failed.push(`${channel}: ${(state.error ?? 'sem detalhe').slice(0, 80)}`);
+      continue;
+    }
+    if (state.status !== 'success') continue;
+    const hoursAgo = (now - state.at.getTime()) / (1000 * 3600);
     if (hoursAgo > STALE_HOURS_THRESHOLD) {
       stale.push(`${channel}: último success há ${Math.round(hoursAgo)}h`);
     }
   }
-  const recentFailures = Array.from(latestFailedByChannel.entries())
-    .filter(([, { at }]) => (now - at.getTime()) / (1000 * 3600) < 48)
-    .map(([channel, { error }]) => `${channel}: ${(error ?? 'sem detalhe').slice(0, 80)}`);
 
-  if (stale.length === 0 && recentFailures.length === 0) {
+  if (stale.length === 0 && failed.length === 0) {
     return {
       id: 'etl_stale',
       category: 'etl_status',
       name: 'ETL freshness',
       severity: 'ok',
-      message: `Todos os canais com etl_run success recente. ${latestSuccessByChannel.size} channels activos.`,
+      message: `${latestRunByChannel.size} canais com mais recente run = success, dentro de ${STALE_HOURS_THRESHOLD}h.`,
     };
   }
-  if (recentFailures.length > 0) {
+  if (failed.length > 0) {
     return {
       id: 'etl_stale',
       category: 'etl_status',
       name: 'ETL freshness',
       severity: 'warning',
-      message: `Falhas recentes (<48h): ${recentFailures.join('; ')}`,
-      count: recentFailures.length,
-      hint: 'Inspeccionar etl_runs com status=failed para ver o erro full. Pode ser token expirado, schema change, ou rate limit.',
+      message: `Última run de ${failed.length} canal(is) ainda em failed: ${failed.join('; ')}`,
+      count: failed.length,
+      hint: 'Re-disparar manualmente "Trigger ingest" para forçar nova run. Se persistir, verificar token / scope / schema.',
     };
   }
   return {
