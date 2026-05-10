@@ -48,7 +48,8 @@ async function getBusinessHealth(
 
   // 1. Read pre-computed KPIs from kpi_snapshots (Synthesize layer
   // já fez o trabalho — aqui só agregamos os daily snapshots em
-  // janela 30d).
+  // janela 30d, com chave composta (channel, metric_key) porque
+  // Shopify e Meta Ads partilham metric_keys curtos.
   const { data: snapData, error: snapErr } = await supabase
     .from('kpi_snapshots')
     .select('channel, metric_key, period_start, value, meta')
@@ -62,36 +63,63 @@ async function getBusinessHealth(
   }
   const snapshots = (snapData ?? []) as SnapshotRow[];
 
-  const byMetric = new Map<string, SnapshotRow[]>();
+  const byKey = new Map<string, SnapshotRow[]>();
   for (const s of snapshots) {
-    const bucket = byMetric.get(s.metric_key);
+    const k = `${s.channel}:${s.metric_key}`;
+    const bucket = byKey.get(k);
     if (bucket) bucket.push(s);
-    else byMetric.set(s.metric_key, [s]);
+    else byKey.set(k, [s]);
   }
 
-  const sumOf = (key: string): number | null => {
-    const rows = byMetric.get(key);
+  const sumOf = (channel: string, key: string): number | null => {
+    const rows = byKey.get(`${channel}:${key}`);
     if (!rows || rows.length === 0) return null;
     return rows.reduce((s, r) => s + (Number(r.value) || 0), 0);
   };
-  const avgOf = (key: string): number | null => {
-    const rows = byMetric.get(key);
+  const avgOf = (channel: string, key: string): number | null => {
+    const rows = byKey.get(`${channel}:${key}`);
     if (!rows || rows.length === 0) return null;
     const sum = rows.reduce((s, r) => s + (Number(r.value) || 0), 0);
     return sum / rows.length;
   };
 
-  const revenue_30d = sumOf('revenue_day');
-  const orders_30d = sumOf('orders_count_day');
+  // ---- Shopify aggregations
+  const revenue_30d = sumOf('shopify', 'revenue_day');
+  const orders_30d = sumOf('shopify', 'orders_count_day');
   const aov_30d =
     revenue_30d != null && orders_30d && orders_30d > 0
       ? revenue_30d / orders_30d
       : null;
-  const new_customers_30d = sumOf('new_customers_day');
-  const repeat_purchase_rate_30d = avgOf('repeat_purchase_rate_day');
+  const new_customers_30d = sumOf('shopify', 'new_customers_day');
+  const repeat_purchase_rate_30d = avgOf('shopify', 'repeat_purchase_rate_day');
+
+  // ---- Meta Ads aggregations
+  const meta_spend_30d = sumOf('meta_ads', 'spend_day');
+  const meta_impressions_30d = sumOf('meta_ads', 'impressions_day');
+  const meta_clicks_30d = sumOf('meta_ads', 'clicks_day');
+  const meta_purchases_30d = sumOf('meta_ads', 'purchases_day');
+  // Ratios computados aqui (evita média-de-rácios). Sum-based weighted.
+  const meta_ctr_30d =
+    meta_clicks_30d != null && meta_impressions_30d && meta_impressions_30d > 0
+      ? meta_clicks_30d / meta_impressions_30d
+      : null;
+  const meta_cpc_30d =
+    meta_spend_30d != null && meta_clicks_30d && meta_clicks_30d > 0
+      ? meta_spend_30d / meta_clicks_30d
+      : null;
+
+  // ---- Cross-channel (só preenche quando ambos os canais têm dados)
+  const cac_30d =
+    meta_spend_30d != null && new_customers_30d && new_customers_30d > 0
+      ? meta_spend_30d / new_customers_30d
+      : null;
+  const roas_30d =
+    revenue_30d != null && meta_spend_30d && meta_spend_30d > 0
+      ? revenue_30d / meta_spend_30d
+      : null;
 
   // Currency vem do meta de qualquer revenue_day
-  const revenueRows = byMetric.get('revenue_day') ?? [];
+  const revenueRows = byKey.get('shopify:revenue_day') ?? [];
   const currency =
     (revenueRows.find((r) => r.meta?.currency)?.meta?.currency as string | undefined) ??
     null;
@@ -102,6 +130,8 @@ async function getBusinessHealth(
     orders_30d,
     aov_30d,
     repeat_purchase_rate_30d,
+    meta_spend_30d,
+    roas_30d,
     currency,
   });
 
@@ -136,6 +166,35 @@ async function getBusinessHealth(
       });
     }
   }
+  // ROAS heurísticas (cross-channel — só dispara quando temos ambos os canais)
+  if (roas_30d != null && meta_spend_30d != null && meta_spend_30d >= 100) {
+    if (roas_30d < 1.5) {
+      signals.push({
+        severity: 'critical',
+        message: `ROAS abaixo de break-even (${roas_30d.toFixed(1)}x): Shopify gera ${roas_30d.toFixed(1)}€ por cada €1 em Meta Ads.`,
+        suggested_action: 'Pausar campanhas em loss, rever criativos ou audiences. Investigar attribution gaps com GA4.',
+      });
+    } else if (roas_30d < 2.5) {
+      signals.push({
+        severity: 'warning',
+        message: `ROAS marginal (${roas_30d.toFixed(1)}x): margem fina depois de COGS + fees.`,
+        suggested_action: 'Identificar campanhas com ROAS > média e realocar spend.',
+      });
+    } else if (roas_30d > 4) {
+      signals.push({
+        severity: 'info',
+        message: `ROAS forte (${roas_30d.toFixed(1)}x) — possível headroom para escalar spend.`,
+        suggested_action: 'Aumentar daily budgets das top campaigns gradualmente (10-20% por semana).',
+      });
+    }
+  }
+  if (cac_30d != null && aov_30d != null && cac_30d > aov_30d * 1.5) {
+    signals.push({
+      severity: 'warning',
+      message: `CAC (${Math.round(cac_30d)}€) muito acima de AOV (${Math.round(aov_30d)}€) — payback depende fortemente de retenção.`,
+      suggested_action: 'Foco em LTV: email/WhatsApp flows pós-compra, programa fidelidade.',
+    });
+  }
 
   // 4. Staleness — último etl_run com sucesso por canal
   const { data: lastRuns } = await supabase
@@ -161,14 +220,20 @@ async function getBusinessHealth(
     headline,
     kpis: {
       revenue_30d,
-      revenue_change_pct: null,        // Phase 2 — precisa 60d para comparar
+      revenue_change_pct: null,        // ainda null — precisa 60d
       orders_30d,
       aov_30d,
       new_customers_30d,
       repeat_purchase_rate_30d,
-      cac_30d: null,                   // Phase 2 — precisa Meta Ads
-      ltv_30d: null,                   // Phase 2 — cohort separado
-      roas_30d: null,                  // Phase 2 — precisa Meta Ads
+      meta_spend_30d,
+      meta_impressions_30d,
+      meta_clicks_30d,
+      meta_ctr_30d,
+      meta_cpc_30d,
+      meta_purchases_30d,
+      cac_30d,
+      roas_30d,
+      ltv_30d: null,                   // ainda null — cohort separado
     },
     signals,
     staleness,
@@ -180,20 +245,34 @@ function buildHeadline(args: {
   orders_30d: number | null;
   aov_30d: number | null;
   repeat_purchase_rate_30d: number | null;
+  meta_spend_30d: number | null;
+  roas_30d: number | null;
   currency: string | null;
 }): string {
-  const { revenue_30d, orders_30d, aov_30d, repeat_purchase_rate_30d, currency } = args;
-  if (revenue_30d == null || orders_30d == null) {
-    return 'Sem dados de Shopify nos últimos 30 dias.';
-  }
+  const { revenue_30d, orders_30d, aov_30d, repeat_purchase_rate_30d, meta_spend_30d, roas_30d, currency } = args;
   const sym = currency === 'EUR' ? '€' : currency === 'USD' ? '$' : `${currency ?? ''} `;
   const fmtMoney = (v: number | null) =>
     v == null ? '?' : `${sym}${Math.round(v).toLocaleString('pt-PT')}`;
-  const repeat =
-    repeat_purchase_rate_30d != null
-      ? `, repeat ${Math.round(repeat_purchase_rate_30d * 100)}%`
-      : '';
-  return `Últimos 30d: ${fmtMoney(revenue_30d)} em ${orders_30d} orders (AOV ${fmtMoney(aov_30d)}${repeat}).`;
+
+  if (revenue_30d == null && meta_spend_30d == null) {
+    return 'Sem dados ingeridos nos últimos 30 dias.';
+  }
+
+  // Caso 1: só Meta Ads (sem Shopify)
+  if (revenue_30d == null && meta_spend_30d != null) {
+    return `Últimos 30d: spend Meta ${fmtMoney(meta_spend_30d)} (sem Shopify ligado).`;
+  }
+
+  // Caso 2: só Shopify (sem Meta) ou ambos
+  const shopifyPart = revenue_30d != null && orders_30d != null
+    ? `${fmtMoney(revenue_30d)} em ${orders_30d} orders (AOV ${fmtMoney(aov_30d)}${repeat_purchase_rate_30d != null ? `, repeat ${Math.round(repeat_purchase_rate_30d * 100)}%` : ''})`
+    : '';
+
+  const metaPart = meta_spend_30d != null
+    ? `, spend Meta ${fmtMoney(meta_spend_30d)}${roas_30d != null ? ` (ROAS ${roas_30d.toFixed(1)}x)` : ''}`
+    : '';
+
+  return `Últimos 30d: ${shopifyPart}${metaPart}.`;
 }
 
 // ===== Tool registry =========================================================

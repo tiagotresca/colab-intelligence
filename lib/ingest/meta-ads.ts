@@ -3,6 +3,7 @@
 
 import { paginateMeta, type EmpresaWithMetaAds } from '../meta-ads.js';
 import { supabase } from '../supabase.js';
+import { synthesizeMetaAds } from '../synthesize/meta-ads.js';
 
 const LOOKBACK_DAYS_FIRST_RUN = 30;
 const REFETCH_RECENT_DAYS = 7;
@@ -49,6 +50,8 @@ export interface EmpresaResult {
   status: 'success' | 'failed' | 'failed_pre_run';
   campaigns?: number;
   insights?: number;
+  kpis_upserted?: number;
+  days_computed?: number;
   range?: { start: string; end: string };
   error?: string;
 }
@@ -232,7 +235,9 @@ export async function ingestMetaAdsEmpresa(e: EmpresaWithMetaAds): Promise<Empre
       insightsIngested += rows.length;
     }
 
-    // 5. Synthesize entra no PR B (próximo)
+    // 5. Synthesize — lê meta_ads_insights_raw, computa KPIs, upsert kpi_snapshots.
+    // Janela própria 30d, recomputa todo o histórico relevante (idempotente).
+    const synth = await synthesizeMetaAds(e.empresa_id);
 
     // 6. Close etl_run
     await supabase
@@ -250,6 +255,8 @@ export async function ingestMetaAdsEmpresa(e: EmpresaWithMetaAds): Promise<Empre
       status: 'success',
       campaigns: campaignsIngested,
       insights: insightsIngested,
+      kpis_upserted: synth.kpis_upserted,
+      days_computed: synth.days_computed,
       range: { start: rangeStart, end: rangeEnd },
     };
   } catch (err) {

@@ -40,14 +40,22 @@ export interface BusinessHealthOutput {
   headline: string; // 1 frase: "estado geral em 1 frase"
   kpis: {
     revenue_30d: number | null;
-    revenue_change_pct: number | null;       // Phase 2 — precisa 60d para comparar
+    revenue_change_pct: number | null;       // ainda null — precisa 60d para comparar
     orders_30d: number | null;
     aov_30d: number | null;
     new_customers_30d: number | null;
     repeat_purchase_rate_30d: number | null; // 0..1
-    cac_30d: number | null;                  // Phase 2 — precisa Meta Ads
-    ltv_30d: number | null;                  // Phase 2 — precisa cohort
-    roas_30d: number | null;                 // Phase 2 — precisa Meta Ads
+    // Meta Ads — base metrics e ratios
+    meta_spend_30d: number | null;
+    meta_impressions_30d: number | null;
+    meta_clicks_30d: number | null;
+    meta_ctr_30d: number | null;             // 0..1 (clicks÷impressions)
+    meta_cpc_30d: number | null;             // currency
+    meta_purchases_30d: number | null;       // Meta-attributed purchases
+    // Cross-channel — só preenchidos quando Shopify + Meta presentes
+    cac_30d: number | null;                  // meta_spend ÷ shopify_new_customers
+    roas_30d: number | null;                 // shopify_revenue ÷ meta_spend (verdadeiro)
+    ltv_30d: number | null;                  // ainda null — precisa cohort
   };
   signals: Array<{
     severity: 'info' | 'warning' | 'critical';
