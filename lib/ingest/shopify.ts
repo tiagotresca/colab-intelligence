@@ -9,8 +9,14 @@ import {
 import { supabase } from '../supabase.js';
 import { synthesizeShopify } from '../synthesize/shopify.js';
 import { deriveAttributionShopify } from '../synthesize/attribution-shopify.js';
+import { synthesizeCustomersShopify } from '../synthesize/customers.js';
 
-const LOOKBACK_DAYS_FIRST_RUN = 30;
+// Lookback para a primeira run de uma empresa. Bumped 30→60 em 2026-05-10
+// (PR A.5). 60 é o máximo permitido pelo Shopify scope `read_orders`.
+// Para ir além (ingestão histórica completa), pedir aprovação de
+// `read_all_orders` no Shopify Partner Dashboard e bumpar para 1825+.
+// Ver docs/vision-attribution-engine.md → "Sequenciamento sugerido".
+const LOOKBACK_DAYS_FIRST_RUN = 60;
 const REFETCH_RECENT_DAYS = 7;
 
 interface ShopifyOrder {
@@ -49,6 +55,7 @@ export interface EmpresaResult {
   kpis_upserted?: number;
   days_computed?: number;
   attribution_derived?: number;
+  customers_synthesized?: number;
   range?: { start: string; end: string };
   error?: string;
 }
@@ -209,7 +216,12 @@ export async function ingestShopifyEmpresa(
     // shopify_order_attribution. Idempotente.
     const attr = await deriveAttributionShopify(e.empresa_id);
 
-    // 5b. Synthesize — lê raw, computa KPIs, upsert kpi_snapshots
+    // 5b. Synthesize customers — agrega por email_hash, derive lifetime
+    // aggregates + acquisition do primeiro order, popula `customers`.
+    // Tem de correr DEPOIS de attribution (lê de shopify_order_attribution).
+    const customersSynth = await synthesizeCustomersShopify(e.empresa_id);
+
+    // 5c. Synthesize KPIs — lê raw, computa KPIs daily, upsert kpi_snapshots
     const synth = await synthesizeShopify(e.empresa_id);
 
     // 6. Close run success
@@ -231,6 +243,7 @@ export async function ingestShopifyEmpresa(
       kpis_upserted: synth.kpis_upserted,
       days_computed: synth.days_computed,
       attribution_derived: attr.rows_derived,
+      customers_synthesized: customersSynth.customers_synthesized,
       range: { start: rangeStart, end: rangeEnd },
     };
   } catch (err) {
