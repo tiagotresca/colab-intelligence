@@ -25,6 +25,14 @@ import {
   synthesizeCustomersShopify,
   synthesizeCustomersFromManual,
 } from '../lib/synthesize/customers.js';
+import { synthesizeShopify } from '../lib/synthesize/shopify.js';
+import { synthesizeMetaAds } from '../lib/synthesize/meta-ads.js';
+import { deriveAttributionShopify } from '../lib/synthesize/attribution-shopify.js';
+import {
+  runAuditForEmpresa,
+  type AuditCheck,
+  type Severity,
+} from '../lib/audit/checks.js';
 
 interface EmpresaRow {
   id: string;
@@ -82,13 +90,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'POST') {
     const action = (req.query.action as string | undefined) ?? 'trigger-ingest';
     if (action === 'import-orders') return handleImport(req, res);
+    if (action === 'resynth-attribution') return handleResynthAttribution(req, res);
+    if (action === 'resynth-customers') return handleResynthCustomers(req, res);
+    if (action === 'resynth-kpis') return handleResynthKpis(req, res);
+    if (action === 'resynth-all') return handleResynthAll(req, res);
     return handleTrigger(req, res);
   }
 
   // GET — render
+  const view = (req.query.view as string | undefined) ?? 'overview';
   const selectedEmpresaId = (req.query.empresa as string | undefined)?.trim();
   const justTriggered = req.query.triggered === '1';
   const justImported = req.query.imported === '1';
+  const justResynced = req.query.resynced === '1';
 
   const { data: empresasData, error: empresasErr } = await supabase
     .from('empresas')
@@ -102,6 +116,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const empresa =
     empresas.find((e) => e.id === selectedEmpresaId) ?? empresas[0];
+
+  // ---- Audit view ----------------------------------------------------------
+  if (view === 'audit' && empresa) {
+    const checks = await runAuditForEmpresa(empresa.id);
+    const html = renderAuditView({
+      empresas,
+      selected: empresa,
+      checks,
+      justResynced,
+    });
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).send(html);
+    return;
+  }
 
   let kpis: KpiRow[] = [];
   let runs: EtlRunRow[] = [];
@@ -352,6 +381,98 @@ async function handleImport(req: VercelRequest, res: VercelResponse) {
   }
 }
 
+// ---- Re-synth handlers (selectivos) ----------------------------------------
+
+async function getEmpresaIdFromReq(
+  req: VercelRequest,
+  res: VercelResponse,
+): Promise<string | null> {
+  const empresa = (req.query.empresa as string | undefined)?.trim();
+  if (!empresa) {
+    res.status(400).json({ ok: false, error: 'missing empresa query param' });
+    return null;
+  }
+  return empresa;
+}
+
+function redirectBackToAudit(
+  res: VercelResponse,
+  empresa: string,
+  resyncedFlag: boolean,
+) {
+  res.setHeader(
+    'Location',
+    `/dashboard?view=audit&empresa=${empresa}${resyncedFlag ? '&resynced=1' : ''}`,
+  );
+  res.status(303).send('Redirecting...');
+}
+
+async function handleResynthAttribution(req: VercelRequest, res: VercelResponse) {
+  const empresa_id = await getEmpresaIdFromReq(req, res);
+  if (!empresa_id) return;
+  try {
+    const result = await deriveAttributionShopify(empresa_id);
+    res.setHeader('x-resynth-result', JSON.stringify(result));
+    redirectBackToAudit(res, empresa_id, true);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'erro desconhecido',
+    });
+  }
+}
+
+async function handleResynthCustomers(req: VercelRequest, res: VercelResponse) {
+  const empresa_id = await getEmpresaIdFromReq(req, res);
+  if (!empresa_id) return;
+  try {
+    await synthesizeCustomersShopify(empresa_id);
+    redirectBackToAudit(res, empresa_id, true);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'erro desconhecido',
+    });
+  }
+}
+
+async function handleResynthKpis(req: VercelRequest, res: VercelResponse) {
+  const empresa_id = await getEmpresaIdFromReq(req, res);
+  if (!empresa_id) return;
+  try {
+    await Promise.all([
+      synthesizeShopify(empresa_id),
+      synthesizeMetaAds(empresa_id),
+    ]);
+    redirectBackToAudit(res, empresa_id, true);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'erro desconhecido',
+    });
+  }
+}
+
+async function handleResynthAll(req: VercelRequest, res: VercelResponse) {
+  const empresa_id = await getEmpresaIdFromReq(req, res);
+  if (!empresa_id) return;
+  try {
+    // Order matters: attribution → customers → KPIs (dependentes downstream)
+    await deriveAttributionShopify(empresa_id);
+    await synthesizeCustomersShopify(empresa_id);
+    await Promise.all([
+      synthesizeShopify(empresa_id),
+      synthesizeMetaAds(empresa_id),
+    ]);
+    redirectBackToAudit(res, empresa_id, true);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'erro desconhecido',
+    });
+  }
+}
+
 // ---- Business health (replica simplificada do MCP tool) ---------------------
 
 async function computeBusinessHealth(empresa: EmpresaRow) {
@@ -565,6 +686,10 @@ function renderDashboard(args: RenderArgs): string {
   summary { cursor: pointer; color: #7d8590; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
   pre { background: #0d1117; padding: 16px; border-radius: 6px; overflow: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 12px 0 0; }
   .toast { background: #033a16; border: 1px solid #2ea043; color: #56d364; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #21262d; }
+  .tab { padding: 8px 14px; color: #7d8590; text-decoration: none; font-size: 13px; border-bottom: 2px solid transparent; }
+  .tab:hover { color: #e6edf3; }
+  .tab-active { color: #e6edf3; border-bottom-color: #56d364; }
   .import-wrap { background: #161b22; border: 1px solid #30363d; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; }
   .import-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .import-label { color: #7d8590; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
@@ -583,6 +708,13 @@ function renderDashboard(args: RenderArgs): string {
   colab-intelligence
   <span class="meta">${new Date().toLocaleString('pt-PT')}</span>
 </h1>
+
+${selected ? `
+<nav class="tabs">
+  <a href="/dashboard?empresa=${selected.id}" class="tab tab-active">Overview</a>
+  <a href="/dashboard?view=audit&empresa=${selected.id}" class="tab">Audit</a>
+</nav>
+` : ''}
 
 ${justTriggered ? '<div class="toast">✓ Ingest disparado. Resultados refrescados em baixo.</div>' : ''}
 ${justImported ? '<div class="toast">✓ Import concluído. Customers re-sintetizados.</div>' : ''}
@@ -853,4 +985,197 @@ function escapeHtml(s: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+// ---- Audit view rendering --------------------------------------------------
+
+interface AuditRenderArgs {
+  empresas: EmpresaRow[];
+  selected: EmpresaRow;
+  checks: AuditCheck[];
+  justResynced: boolean;
+}
+
+const SEVERITY_LABEL: Record<Severity, string> = {
+  ok: '✓ OK',
+  info: 'i  Info',
+  warning: '⚠ Warning',
+  critical: '✗ Critical',
+};
+
+const CATEGORY_LABEL: Record<string, string> = {
+  data_integrity: 'Data integrity',
+  source_consistency: 'Source consistency',
+  kpi_sanity: 'KPI sanity',
+  modules: 'Modules (subscriptions/subjects)',
+  attribution: 'Attribution',
+  etl_status: 'ETL status',
+};
+
+function renderAuditView(args: AuditRenderArgs): string {
+  const { empresas, selected, checks, justResynced } = args;
+
+  const empresaOpts = empresas
+    .map(
+      (e) =>
+        `<option value="${e.id}" ${e.id === selected.id ? 'selected' : ''}>${escapeHtml(e.name)}</option>`,
+    )
+    .join('');
+
+  // Group by category, in fixed order
+  const CATEGORY_ORDER: Array<keyof typeof CATEGORY_LABEL> = [
+    'etl_status', 'data_integrity', 'source_consistency',
+    'kpi_sanity', 'attribution', 'modules',
+  ];
+  const grouped = new Map<string, AuditCheck[]>();
+  for (const c of checks) {
+    if (!grouped.has(c.category)) grouped.set(c.category, []);
+    grouped.get(c.category)!.push(c);
+  }
+
+  const sections = CATEGORY_ORDER.filter((cat) => grouped.has(cat))
+    .map((cat) => {
+      const items = grouped.get(cat)!;
+      const itemsHtml = items.map((c) => {
+        const examples = c.examples && c.examples.length > 0
+          ? `<div class="check-examples">Exemplos: ${c.examples.map((e) => escapeHtml(String(e))).join(', ')}</div>`
+          : '';
+        const hint = c.hint
+          ? `<div class="check-hint">💡 ${escapeHtml(c.hint)}</div>`
+          : '';
+        const countBadge = c.count !== undefined
+          ? `<span class="check-count">${c.count.toLocaleString('pt-PT')}</span>`
+          : '';
+        return `
+          <div class="check check-${c.severity}">
+            <div class="check-header">
+              <span class="check-severity">${SEVERITY_LABEL[c.severity]}</span>
+              <span class="check-name">${escapeHtml(c.name)}</span>
+              ${countBadge}
+            </div>
+            <div class="check-message">${escapeHtml(c.message)}</div>
+            ${hint}
+            ${examples}
+          </div>
+        `;
+      }).join('');
+      return `
+        <h2 class="audit-section-h">${CATEGORY_LABEL[cat]}</h2>
+        <div class="checks">${itemsHtml}</div>
+      `;
+    })
+    .join('');
+
+  // Severity counts for header summary
+  const sevCounts = { ok: 0, info: 0, warning: 0, critical: 0 };
+  for (const c of checks) sevCounts[c.severity]++;
+
+  const summaryBadges = (Object.entries(sevCounts) as Array<[Severity, number]>)
+    .filter(([, n]) => n > 0)
+    .map(([sev, n]) => `<span class="summary-badge summary-${sev}">${SEVERITY_LABEL[sev]} ${n}</span>`)
+    .join(' ');
+
+  return `<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<title>colab-intelligence — audit</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0d1117; color: #e6edf3;
+    margin: 0; padding: 24px;
+  }
+  h1, h2 { font-weight: 600; margin: 0 0 16px; }
+  h1 { font-size: 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  h1 .meta { color: #7d8590; font-size: 12px; font-weight: 400; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: #7d8590; margin-top: 32px; }
+  select, button {
+    background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+    padding: 6px 12px; font: inherit; border-radius: 6px;
+  }
+  button { cursor: pointer; }
+  button.primary { background: #238636; border-color: #2ea043; color: white; }
+  button.primary:hover { background: #2ea043; }
+  .controls { display: flex; gap: 12px; align-items: center; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #21262d; }
+  .tab { padding: 8px 14px; color: #7d8590; text-decoration: none; font-size: 13px; border-bottom: 2px solid transparent; }
+  .tab:hover { color: #e6edf3; }
+  .tab-active { color: #e6edf3; border-bottom-color: #56d364; }
+  .toast { background: #033a16; border: 1px solid #2ea043; color: #56d364; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; }
+  .summary { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .summary-badge { padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .summary-ok { background: #033a16; color: #56d364; }
+  .summary-info { background: #21262d; color: #8b949e; }
+  .summary-warning { background: #4d2d00; color: #e3b341; }
+  .summary-critical { background: #4c1014; color: #f85149; }
+  .resynth-wrap { background: #161b22; border: 1px solid #30363d; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; }
+  .resynth-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .resynth-label { color: #7d8590; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  .btn-secondary { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 6px 12px; font: inherit; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .btn-secondary:hover { background: #30363d; }
+  .audit-section-h { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: #7d8590; margin-top: 24px; margin-bottom: 8px; font-weight: 600; }
+  .checks { display: flex; flex-direction: column; gap: 8px; }
+  .check { background: #161b22; border: 1px solid #30363d; border-left: 3px solid #30363d; border-radius: 6px; padding: 12px 16px; }
+  .check-ok { border-left-color: #56d364; }
+  .check-info { border-left-color: #58a6ff; }
+  .check-warning { border-left-color: #e3b341; }
+  .check-critical { border-left-color: #f85149; }
+  .check-header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .check-severity { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; padding: 2px 8px; border-radius: 4px; background: #21262d; }
+  .check-ok .check-severity { color: #56d364; }
+  .check-info .check-severity { color: #58a6ff; }
+  .check-warning .check-severity { color: #e3b341; }
+  .check-critical .check-severity { color: #f85149; }
+  .check-name { font-weight: 600; flex: 1; }
+  .check-count { font-variant-numeric: tabular-nums; color: #7d8590; font-size: 12px; }
+  .check-message { color: #c9d1d9; font-size: 13px; margin-top: 2px; }
+  .check-hint { margin-top: 6px; font-size: 12px; color: #7d8590; }
+  .check-examples { margin-top: 4px; font-size: 11px; color: #7d8590; font-family: ui-monospace, SFMono-Regular, monospace; }
+</style>
+</head>
+<body>
+<h1>
+  colab-intelligence — audit
+  <span class="meta">${new Date().toLocaleString('pt-PT')}</span>
+</h1>
+
+<nav class="tabs">
+  <a href="/dashboard?empresa=${selected.id}" class="tab">Overview</a>
+  <a href="/dashboard?view=audit&empresa=${selected.id}" class="tab tab-active">Audit</a>
+</nav>
+
+${justResynced ? '<div class="toast">✓ Re-synth concluído. Checks abaixo refrescados.</div>' : ''}
+
+<form method="get" action="/dashboard" class="controls" style="margin-bottom: 16px;">
+  <input type="hidden" name="view" value="audit">
+  <label>Empresa:</label>
+  <select name="empresa" onchange="this.form.submit()">${empresaOpts}</select>
+</form>
+
+<div class="summary">${summaryBadges || '<span class="muted">Sem checks executados.</span>'}</div>
+
+<div class="resynth-wrap">
+  <div class="resynth-controls">
+    <label class="resynth-label">Re-synth selectivo:</label>
+    <form method="post" action="/dashboard?action=resynth-attribution&empresa=${selected.id}" style="display: inline;">
+      <button class="btn-secondary" type="submit">Re-derive attribution</button>
+    </form>
+    <form method="post" action="/dashboard?action=resynth-customers&empresa=${selected.id}" style="display: inline;">
+      <button class="btn-secondary" type="submit">Re-synth customers</button>
+    </form>
+    <form method="post" action="/dashboard?action=resynth-kpis&empresa=${selected.id}" style="display: inline;">
+      <button class="btn-secondary" type="submit">Re-synth KPIs</button>
+    </form>
+    <form method="post" action="/dashboard?action=resynth-all&empresa=${selected.id}" style="display: inline;">
+      <button class="primary" type="submit">▶ Re-synth tudo (sequencial)</button>
+    </form>
+  </div>
+</div>
+
+${sections}
+
+</body></html>`;
 }
